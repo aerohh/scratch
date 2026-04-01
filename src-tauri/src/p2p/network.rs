@@ -185,14 +185,13 @@ impl NetworkManager {
                                 });
 
                                 if let Some(peer) = remote_peer {
-                                    if runtime_state.lock().expect("runtime state lock").connected_peers.contains(&peer) {
-                                        swarm.behaviour_mut().request_response.send_request(
-                                            &peer,
-                                            SyncMessage::RequestManifest { share_id },
-                                        );
-                                    } else {
-                                        pending_manifest.insert((peer, share_id));
-                                    }
+                                    pending_manifest.insert((peer, share_id.clone()));
+                                    // Trigger a dial/sync attempt immediately. If address is not
+                                    // known yet, we'll retry after discovery/connection events.
+                                    swarm.behaviour_mut().request_response.send_request(
+                                        &peer,
+                                        SyncMessage::RequestManifest { share_id },
+                                    );
                                 }
                             }
                             NetworkCommand::RemoveShare { share_id } => {
@@ -307,6 +306,20 @@ impl NetworkManager {
                                     mdns::Event::Discovered(peers) => {
                                         for (peer_id, addr) in peers {
                                             swarm.behaviour_mut().request_response.add_address(&peer_id, addr);
+
+                                            // If we were waiting on this peer, request manifest now.
+                                            let to_request: Vec<String> = pending_manifest
+                                                .iter()
+                                                .filter(|(peer, _)| *peer == peer_id)
+                                                .map(|(_, share_id)| share_id.clone())
+                                                .collect();
+                                            for share_id in to_request {
+                                                swarm.behaviour_mut().request_response.send_request(
+                                                    &peer_id,
+                                                    SyncMessage::RequestManifest { share_id: share_id.clone() },
+                                                );
+                                                pending_manifest.remove(&(peer_id, share_id));
+                                            }
                                         }
                                     }
                                     mdns::Event::Expired(_peers) => {}
