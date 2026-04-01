@@ -22,9 +22,10 @@ tauri-plugin-updater = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 anyhow = "1"
+async-trait = "0.1"
 notify = "6"
 tantivy = "0.22"
-tokio = { version = "1", features = ["fs", "sync"] }
+tokio = { version = "1", features = ["fs", "sync", "macros", "rt", "time"] }
 base64 = "0.22"
 url = "2"
 urlencoding = "2"
@@ -33,3 +34,24 @@ regex = "1"
 walkdir = "2"
 tauri-plugin-single-instance = "2"
 chrono = "0.4"
+log = "0.4"
+
+# P2P sharing
+libp2p = { version = "0.54", features = [
+    "tokio",             # Tokio runtime integration
+    "macros",            # Derive(NetworkBehaviour)
+    "mdns",              # Local network discovery
+    "tcp",               # TCP transport
+    "noise",             # Encryption
+    "yamux",             # Stream multiplexing
+    "gossipsub",         # Pub/sub messaging
+    "request-response",  # Direct messaging
+    "identify",          # Peer identification
+    "relay",             # NAT traversal relay
+    "autonat",           # Auto NAT traversal
+    "ping",              # Keep-alive protocol
+    "serde",             # Serialization
+] }
+sha2 = "0.10"
+rand = "0.8"
+hex = "0.4"

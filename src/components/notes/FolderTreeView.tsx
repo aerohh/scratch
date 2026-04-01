@@ -21,6 +21,7 @@ import {
   AlertDialogHeader,
   AlertDialogTitle,
 } from "../ui";
+import { ShareModal } from "../share";
 import { invoke } from "@tauri-apps/api/core";
 import {
   ChevronRightIcon,
@@ -33,6 +34,7 @@ import {
   PinIcon,
   CopyIcon,
   ArrowUpIcon,
+  ShareIcon,
 } from "../icons";
 import * as notesService from "../../services/notes";
 import type { FolderNode, NoteMetadata, Settings } from "../../types/note";
@@ -251,6 +253,7 @@ interface FolderItemProps {
   onDeleteNote: (id: string) => void;
   onMoveNoteToParent: (id: string, targetFolder: string) => void;
   onMoveFolderToParent: (path: string, targetParent: string) => void;
+  onShareFolder: (path: string, name: string) => void;
 }
 
 const FolderItemComponent = memo(function FolderItem({
@@ -272,6 +275,7 @@ const FolderItemComponent = memo(function FolderItem({
   onDeleteNote,
   onMoveNoteToParent,
   onMoveFolderToParent,
+  onShareFolder,
 }: FolderItemProps) {
   const isCollapsed = collapsedFolders.has(folder.path);
   const noteCount = countNotesInFolder(folder);
@@ -353,6 +357,7 @@ const FolderItemComponent = memo(function FolderItem({
                   onDeleteNote={onDeleteNote}
                   onMoveNoteToParent={onMoveNoteToParent}
                   onMoveFolderToParent={onMoveFolderToParent}
+                  onShareFolder={onShareFolder}
                 />
               ))}
               {folder.notes.map((note) => (
@@ -436,6 +441,17 @@ const FolderItemComponent = memo(function FolderItem({
           )}
           <ContextMenu.Separator className={menuSeparatorClass} />
           <ContextMenu.Item
+            className={menuItemClass}
+            onSelect={() => {
+              const parts = folder.path.split("/");
+              onShareFolder(folder.path, parts[parts.length - 1]);
+            }}
+          >
+            <ShareIcon className="w-4 h-4 stroke-[1.6]" />
+            Share Folder...
+          </ContextMenu.Item>
+          <ContextMenu.Separator className={menuSeparatorClass} />
+          <ContextMenu.Item
             className={
               menuItemClass +
               " text-red-500 hover:text-red-500 focus:text-red-500"
@@ -488,6 +504,8 @@ export function FolderTreeView({
   const [noteDeleteDialogOpen, setNoteDeleteDialogOpen] = useState(false);
   const [noteToDelete, setNoteToDelete] = useState<string | null>(null);
   const [knownFolders, setKnownFolders] = useState<string[]>([]);
+  const [shareModalOpen, setShareModalOpen] = useState(false);
+  const [folderToShare, setFolderToShare] = useState<{ path: string; name: string } | null>(null);
   const containerRef = useRef<HTMLDivElement>(null);
 
   // Load known folders from disk (includes empty folders)
@@ -561,6 +579,11 @@ export function FolderTreeView({
   const handleDeleteFolder = useCallback((path: string) => {
     setFolderToDelete(path);
     setDeleteDialogOpen(true);
+  }, []);
+
+  const handleShareFolder = useCallback((path: string, name: string) => {
+    setFolderToShare({ path, name });
+    setShareModalOpen(true);
   }, []);
 
   const handleDeleteConfirm = useCallback(async () => {
@@ -765,6 +788,7 @@ export function FolderTreeView({
             onDeleteNote={openDeleteNoteDialog}
             onMoveNoteToParent={moveNote}
             onMoveFolderToParent={moveFolder}
+            onShareFolder={handleShareFolder}
           />
         ))}
 
@@ -847,6 +871,15 @@ export function FolderTreeView({
           </AlertDialogFooter>
         </AlertDialogContent>
       </AlertDialog>
+
+      {/* Share folder modal */}
+      {shareModalOpen && folderToShare && (
+        <ShareModal
+          folderPath={folderToShare.path}
+          folderName={folderToShare.name}
+          onClose={() => setShareModalOpen(false)}
+        />
+      )}
     </>
   );
 }

@@ -638,10 +638,20 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       if (externalChanges.length > 0) {
         refreshNotes();
 
-        // If the currently selected note was changed externally, set flag (don't auto-reload)
+        // If the currently selected note was changed externally, reload immediately
+        // so collaborative edits appear in real time.
         const currentId = selectedNoteIdRef.current;
         if (currentId && externalChanges.includes(currentId)) {
-          setHasExternalChanges(true);
+          void notesService
+            .readNote(currentId)
+            .then((note) => {
+              setCurrentNote(note);
+              setHasExternalChanges(false);
+            })
+            .catch((err) => {
+              setError(err instanceof Error ? err.message : "Failed to reload note");
+              setHasExternalChanges(true);
+            });
         }
       }
     }).then((fn) => {
@@ -672,6 +682,17 @@ export function NotesProvider({ children }: { children: ReactNode }) {
       unlisten.then((fn) => fn());
     };
   }, [selectNote, refreshNotes]);
+
+  // Listen for accepted-share events so newly shared folders appear immediately.
+  useEffect(() => {
+    const unlisten = listen("p2p-share-accepted", async () => {
+      await refreshNotes();
+      await notesService.startFileWatcher();
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, [refreshNotes]);
 
   // Refresh notes when folder changes
   useEffect(() => {

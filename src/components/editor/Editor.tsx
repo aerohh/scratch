@@ -1149,6 +1149,8 @@ export function Editor({
   const loadedNoteIdRef = useRef<string | null>(null);
   // Track the modified timestamp of the loaded content
   const loadedModifiedRef = useRef<number | null>(null);
+  // Track the last content loaded into the editor for same-note external update detection
+  const loadedContentRef = useRef<string | null>(null);
   // Track the last save (note ID and content) to detect our own saves vs external changes
   const lastSaveRef = useRef<{ noteId: string; content: string } | null>(null);
   // Track reloadVersion to detect manual refreshes
@@ -1284,6 +1286,7 @@ export function Editor({
       ) {
         loadedNoteIdRef.current = currentNote.id;
         loadedModifiedRef.current = currentNote.modified;
+        loadedContentRef.current = currentNote.content;
         lastSaveRef.current = null;
         // If user typed during the rename, flush with the now-correct ID
         if (needsSaveRef.current) {
@@ -1313,6 +1316,7 @@ export function Editor({
         // Manual reload - update the editor content
         lastReloadVersionRef.current = reloadVersion;
         loadedModifiedRef.current = currentNote.modified;
+        loadedContentRef.current = currentNote.content;
         isLoadingRef.current = true;
         const manager = editor.storage.markdown?.manager;
         if (manager) {
@@ -1328,8 +1332,41 @@ export function Editor({
         isLoadingRef.current = false;
         return;
       }
-      // Just a save - update refs but don't reload content
+
+      const lastSave = lastSaveRef.current;
+      const isOwnSave =
+        lastSave?.noteId === currentNote.id &&
+        lastSave?.content === currentNote.content;
+
+      if (!isOwnSave && currentNote.content !== loadedContentRef.current) {
+        // Same note, but content changed externally - apply immediately.
+        loadedModifiedRef.current = currentNote.modified;
+        loadedContentRef.current = currentNote.content;
+        isLoadingRef.current = true;
+        const manager = editor.storage.markdown?.manager;
+        if (manager) {
+          try {
+            const parsed = manager.parse(currentNote.content);
+            editor.commands.setContent(parsed);
+          } catch {
+            editor.commands.setContent(currentNote.content);
+          }
+        } else {
+          editor.commands.setContent(currentNote.content);
+        }
+        if (sourceMode) {
+          setSourceContent(currentNote.content);
+        }
+        isLoadingRef.current = false;
+        return;
+      }
+
+      // Own save or metadata-only change - update refs but don't reload content
       loadedModifiedRef.current = currentNote.modified;
+      loadedContentRef.current = currentNote.content;
+      if (isOwnSave) {
+        lastSaveRef.current = null;
+      }
       return;
     }
 
@@ -1339,6 +1376,7 @@ export function Editor({
 
     loadedNoteIdRef.current = loadingNoteId;
     loadedModifiedRef.current = currentNote.modified;
+    loadedContentRef.current = currentNote.content;
 
     isLoadingRef.current = true;
 

@@ -13,6 +13,7 @@ import {
 import { useNotes } from "../../context/NotesContext";
 import { NoteList } from "../notes/NoteList";
 import { Footer } from "./Footer";
+import { AcceptShareModal } from "../share";
 import { IconButton, Input } from "../ui";
 import {
   PlusIcon,
@@ -22,6 +23,7 @@ import {
   AddNoteIcon,
   FolderPlusIcon,
   NoteIcon,
+  ShareIcon,
 } from "../icons";
 import { mod, shift, isMac } from "../../lib/platform";
 import * as notesService from "../../services/notes";
@@ -48,6 +50,7 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
   const [plusMenuOpen, setPlusMenuOpen] = useState(false);
   const [folderDialogOpen, setFolderDialogOpen] = useState(false);
   const [folderDialogParent, setFolderDialogParent] = useState("");
+  const [acceptShareModalOpen, setAcceptShareModalOpen] = useState(false);
   const [foldersEnabled, setFoldersEnabled] = useState(true);
   const [dragLabel, setDragLabel] = useState<string | null>(null);
   const debounceRef = useRef<number | null>(null);
@@ -324,6 +327,14 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
                     <FolderPlusIcon className="w-4 h-4 stroke-[1.6]" />
                     New Folder
                   </DropdownMenu.Item>
+                  <DropdownMenu.Separator className="h-px bg-border my-1" />
+                  <DropdownMenu.Item
+                    className="px-3 py-1.5 text-sm text-text cursor-pointer outline-none hover:bg-bg-muted focus:bg-bg-muted flex items-center gap-2"
+                    onSelect={() => setAcceptShareModalOpen(true)}
+                  >
+                    <ShareIcon className="w-4 h-4 stroke-[1.6]" />
+                    Join Shared Folder
+                  </DropdownMenu.Item>
                 </DropdownMenu.Content>
               </DropdownMenu.Portal>
             </DropdownMenu.Root>
@@ -382,6 +393,10 @@ export function Sidebar({ onOpenSettings }: SidebarProps) {
         description="Enter a name for your new folder"
         confirmLabel="Create"
       />
+
+      {acceptShareModalOpen && (
+        <AcceptShareModal onClose={() => setAcceptShareModalOpen(false)} />
+      )}
     </div>
 
     {/* Drag overlay — floating label while dragging */}

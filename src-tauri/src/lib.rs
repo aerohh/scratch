@@ -17,6 +17,7 @@ use tokio::fs;
 use tokio::io::AsyncWriteExt;
 
 mod git;
+mod p2p;
 
 // Note metadata for list display
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -331,6 +332,8 @@ pub struct AppState {
     pub file_watcher: Mutex<Option<FileWatcherState>>,
     pub search_index: Mutex<Option<SearchIndex>>,
     pub debounce_map: Arc<Mutex<HashMap<PathBuf, Instant>>>,
+    pub p2p_state: Mutex<p2p::P2PState>,  // P2P network and share state
+    pub p2p_network: Mutex<Option<p2p::NetworkManager>>,  // P2P network manager
 }
 
 impl Default for AppState {
@@ -342,6 +345,8 @@ impl Default for AppState {
             file_watcher: Mutex::new(None),
             search_index: Mutex::new(None),
             debounce_map: Arc::new(Mutex::new(HashMap::new())),
+            p2p_state: Mutex::new(p2p::P2PState::new()),
+            p2p_network: Mutex::new(None),
         }
     }
 }
@@ -571,6 +576,7 @@ fn strip_markdown(text: &str) -> String {
 
 /// Directories to exclude from note discovery and ID resolution.
 const EXCLUDED_DIRS: &[&str] = &[".git", ".scratch", ".obsidian", ".trash", "assets"];
+const PROFILE_ENV_VAR: &str = "SCRATCH_PROFILE";
 
 /// Filter for WalkDir: skips excluded directories.
 fn is_visible_notes_entry(entry: &walkdir::DirEntry) -> bool {
@@ -654,8 +660,7 @@ fn abs_path_from_id(notes_root: &Path, id: &str) -> Result<PathBuf, String> {
 
 // Get app config file path (in app data directory)
 fn get_app_config_path(app: &AppHandle) -> Result<PathBuf> {
-    let app_data = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&app_data)?;
+    let app_data = get_profiled_app_data_dir(app)?;
     Ok(app_data.join("config.json"))
 }
 
@@ -668,9 +673,63 @@ fn get_settings_path(notes_folder: &str) -> PathBuf {
 
 // Get search index path
 fn get_search_index_path(app: &AppHandle) -> Result<PathBuf> {
-    let app_data = app.path().app_data_dir()?;
-    std::fs::create_dir_all(&app_data)?;
+    let app_data = get_profiled_app_data_dir(app)?;
     Ok(app_data.join("search_index"))
+}
+
+fn sanitize_profile_id(profile: &str) -> Option<String> {
+    let trimmed = profile.trim();
+    if trimmed.is_empty() || trimmed.len() > 64 {
+        return None;
+    }
+
+    if !trimmed
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return None;
+    }
+
+    Some(trimmed.to_string())
+}
+
+fn extract_profile_from_args(args: &[String]) -> Option<String> {
+    let mut i = 0;
+    while i < args.len() {
+        let arg = &args[i];
+        if let Some(value) = arg.strip_prefix("--profile=") {
+            if let Some(valid) = sanitize_profile_id(value) {
+                return Some(valid);
+            }
+        } else if arg == "--profile" {
+            if let Some(next) = args.get(i + 1) {
+                if let Some(valid) = sanitize_profile_id(next) {
+                    return Some(valid);
+                }
+            }
+            i += 1;
+        }
+        i += 1;
+    }
+    None
+}
+
+fn current_profile_id() -> Option<String> {
+    std::env::var(PROFILE_ENV_VAR)
+        .ok()
+        .and_then(|value| sanitize_profile_id(&value))
+}
+
+fn get_profiled_app_data_dir(app: &AppHandle) -> Result<PathBuf> {
+    let app_data = app.path().app_data_dir()?;
+    let path = if let Some(profile) = current_profile_id() {
+        app_data.join("profiles").join(profile)
+    } else {
+        app_data
+    };
+
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
 }
 
 // Load app config from disk (notes folder path)
@@ -845,6 +904,7 @@ async fn list_notes(state: State<'_, AppState>) -> Result<Vec<NoteMetadata>, Str
         use walkdir::WalkDir;
         let mut results: Vec<(String, String, String, i64)> = Vec::new();
         for entry in WalkDir::new(&path_clone)
+            .follow_links(true)
             .max_depth(10)
             .into_iter()
             .filter_entry(is_visible_notes_entry)
@@ -1065,6 +1125,13 @@ async fn save_note(
         cache.remove(old_id_str);
     }
 
+    if let Some((ref old_id_str, _)) = old_id {
+        if old_id_str != &final_id {
+            notify_p2p_note_change(&state, old_id_str, true);
+        }
+    }
+    notify_p2p_note_change(&state, &final_id, false);
+
     Ok(Note {
         id: final_id,
         title,
@@ -1105,6 +1172,8 @@ async fn delete_note(id: String, state: State<'_, AppState>) -> Result<(), Strin
         let mut cache = state.notes_cache.write().expect("cache write lock");
         cache.remove(&id);
     }
+
+    notify_p2p_note_change(&state, &id, true);
 
     Ok(())
 }
@@ -1200,6 +1269,8 @@ async fn create_note(target_folder: Option<String>, state: State<'_, AppState>) 
         }
     }
 
+    notify_p2p_note_change(&state, &final_id, false);
+
     Ok(Note {
         id: final_id,
         title: display_title,
@@ -1259,6 +1330,7 @@ async fn list_folders(state: State<'_, AppState>) -> Result<Vec<String>, String>
         let mut folders = Vec::new();
         use walkdir::WalkDir;
         for entry in WalkDir::new(&fp)
+            .follow_links(true)
             .max_depth(10)
             .into_iter()
             .filter_entry(is_visible_notes_entry)
@@ -1541,6 +1613,9 @@ async fn move_note(
             let _ = search_index.rebuild_index(&folder_root);
         }
     }
+
+    notify_p2p_note_change(&state, &id, true);
+    notify_p2p_note_change(&state, &new_id, false);
 
     Ok(new_id)
 }
@@ -2047,6 +2122,92 @@ struct FileChangeEvent {
     changed_ids: Vec<String>,
 }
 
+#[derive(Clone, Debug)]
+struct SymlinkWatchAlias {
+    target_root: PathBuf,
+    alias_relative: PathBuf,
+}
+
+fn collect_symlink_watch_aliases(notes_root: &Path) -> Vec<SymlinkWatchAlias> {
+    use walkdir::WalkDir;
+
+    let mut aliases = Vec::new();
+    let mut seen = HashSet::new();
+
+    for entry in WalkDir::new(notes_root)
+        .max_depth(10)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(is_visible_notes_entry)
+        .flatten()
+    {
+        if !entry.path_is_symlink() {
+            continue;
+        }
+
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+
+        let target_root = match entry_path.canonicalize() {
+            Ok(path) => path,
+            Err(_) => continue,
+        };
+
+        let alias_relative = match entry_path.strip_prefix(notes_root) {
+            Ok(path) if !path.as_os_str().is_empty() => path.to_path_buf(),
+            _ => continue,
+        };
+
+        if seen.insert(target_root.clone()) {
+            aliases.push(SymlinkWatchAlias {
+                target_root,
+                alias_relative,
+            });
+        }
+    }
+
+    aliases
+}
+
+fn id_from_event_path(
+    notes_root: &Path,
+    event_path: &Path,
+    aliases: &[SymlinkWatchAlias],
+) -> Option<String> {
+    if let Some(id) = id_from_abs_path(notes_root, event_path) {
+        return Some(id);
+    }
+
+    let canonical_event = event_path.canonicalize().ok();
+
+    for alias in aliases {
+        let rel = if let Ok(r) = event_path.strip_prefix(&alias.target_root) {
+            Some(r.to_path_buf())
+        } else if let Some(canonical) = canonical_event.as_ref() {
+            canonical
+                .strip_prefix(&alias.target_root)
+                .ok()
+                .map(Path::to_path_buf)
+        } else {
+            None
+        };
+
+        let rel = match rel {
+            Some(r) => r,
+            None => continue,
+        };
+
+        let virtual_path = notes_root.join(&alias.alias_relative).join(rel);
+        if let Some(id) = id_from_abs_path(notes_root, &virtual_path) {
+            return Some(id);
+        }
+    }
+
+    None
+}
+
 fn setup_file_watcher(
     app: AppHandle,
     notes_folder: &str,
@@ -2055,12 +2216,14 @@ fn setup_file_watcher(
     let folder_path = PathBuf::from(notes_folder);
     let notes_root = folder_path.clone();
     let app_handle = app.clone();
+    let symlink_aliases = collect_symlink_watch_aliases(&notes_root);
+    let symlink_aliases_for_cb = symlink_aliases.clone();
 
     let watcher = RecommendedWatcher::new(
         move |res: Result<notify::Event, notify::Error>| {
             if let Ok(event) = res {
                 for path in event.paths.iter() {
-                    let note_id = match id_from_abs_path(&notes_root, path) {
+                    let note_id = match id_from_event_path(&notes_root, path, &symlink_aliases_for_cb) {
                         Some(id) => id,
                         None => continue,
                     };
@@ -2153,6 +2316,22 @@ fn setup_file_watcher(
     watcher
         .watch(&folder_path, RecursiveMode::Recursive)
         .map_err(|e| e.to_string())?;
+
+    // Also watch symlink targets directly so edits/creates in shared linked folders
+    // trigger immediate file-change events.
+    for alias in symlink_aliases {
+        if alias.target_root.starts_with(&folder_path) {
+            continue;
+        }
+        if let Err(err) = watcher.watch(&alias.target_root, RecursiveMode::Recursive) {
+            log::warn!(
+                "Failed to watch symlink target '{}' (alias '{}'): {}",
+                alias.target_root.display(),
+                alias.alias_relative.display(),
+                err
+            );
+        }
+    }
 
     Ok(FileWatcherState { watcher })
 }
@@ -3353,6 +3532,527 @@ async fn ai_execute_ollama(
     }
 }
 
+// ============================================================================
+// P2P Sharing Commands (Phase 1)
+// ============================================================================
+
+/// Start P2P networking
+#[tauri::command]
+async fn p2p_start(app: AppHandle, state: State<'_, AppState>) -> Result<p2p::P2PStatus, String> {
+    let mut network = state.p2p_network.lock().expect("p2p_network lock");
+    let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+
+    // Check if already running
+    if p2p_state.is_running {
+        if let Some(ref net) = *network {
+            if let Some(peer_id) = net.peer_id() {
+                return Ok(p2p::P2PStatus {
+                    is_running: true,
+                    peer_id: peer_id.to_string(),
+                    connected_peers: 0,
+                });
+            }
+        }
+    }
+
+    // Start network
+    let net_manager = &mut *network;
+    let net_manager = net_manager.get_or_insert_with(p2p::NetworkManager::new);
+
+    let peer_id = net_manager
+        .start(app, PathBuf::from(notes_folder))
+        .map_err(|e| format!("Failed to start P2P network: {}", e))?;
+
+    p2p_state.set_running(true);
+    p2p_state.set_peer_id(peer_id.to_string());
+
+    log::info!("P2P started: {}", peer_id);
+
+    Ok(p2p::P2PStatus {
+        is_running: true,
+        peer_id: peer_id.to_string(),
+        connected_peers: 0,
+    })
+}
+
+/// Stop P2P networking
+#[tauri::command]
+async fn p2p_stop(state: State<'_, AppState>) -> Result<(), String> {
+    let mut network = state.p2p_network.lock().expect("p2p_network lock");
+    let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+
+    if let Some(ref mut net) = *network {
+        net.stop()
+            .map_err(|e| format!("Failed to stop P2P network: {}", e))?;
+    }
+
+    p2p_state.set_running(false);
+    p2p_state.peer_id = None;
+
+    log::info!("P2P stopped");
+
+    Ok(())
+}
+
+/// Get P2P status
+#[tauri::command]
+async fn p2p_get_status(state: State<'_, AppState>) -> Result<p2p::P2PStatus, String> {
+    let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+    let network = state.p2p_network.lock().expect("p2p_network lock");
+
+    let peer_id = p2p_state.peer_id.clone().unwrap_or_default();
+    let is_running = p2p_state.is_running;
+
+    // Count connected peers (Phase 2: will use actual peer list)
+    let connected_peers = if is_running {
+        network
+            .as_ref()
+            .map(|n| n.connected_peers())
+            .unwrap_or(0)
+    } else {
+        0
+    };
+
+    Ok(p2p::P2PStatus {
+        is_running,
+        peer_id,
+        connected_peers,
+    })
+}
+
+fn bootstrap_copy_shared_folder(source: &Path, destination: &Path) -> Result<usize, String> {
+    if !source.exists() {
+        return Err(format!(
+            "Shared source folder no longer exists: {}",
+            source.display()
+        ));
+    }
+
+    let source_canonical = source
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve source path: {}", e))?;
+    let destination_canonical = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+
+    if source_canonical == destination_canonical {
+        return Ok(0);
+    }
+
+    let mut copied_files = 0usize;
+
+    for entry in walkdir::WalkDir::new(&source_canonical) {
+        let entry = entry.map_err(|e| format!("Failed reading source folder: {}", e))?;
+        let entry_path = entry.path();
+        let relative = entry_path
+            .strip_prefix(&source_canonical)
+            .map_err(|e| format!("Invalid source path: {}", e))?;
+
+        if relative.as_os_str().is_empty() {
+            continue;
+        }
+
+        if relative
+            .components()
+            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".scratch"))
+        {
+            continue;
+        }
+
+        let target = destination.join(relative);
+
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target)
+                .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+            continue;
+        }
+
+        if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+            }
+
+            std::fs::copy(entry_path, &target)
+                .map_err(|e| format!("Failed to copy '{}' : {}", entry_path.display(), e))?;
+            copied_files += 1;
+        }
+    }
+
+    Ok(copied_files)
+}
+
+fn try_link_shared_folder(source: &Path, destination: &Path) -> Result<bool, String> {
+    if !source.exists() {
+        return Ok(false);
+    }
+
+    let source_canonical = source
+        .canonicalize()
+        .map_err(|e| format!("Failed to resolve source path: {}", e))?;
+    let destination_parent = destination
+        .parent()
+        .ok_or("Invalid destination path".to_string())?;
+
+    std::fs::create_dir_all(destination_parent)
+        .map_err(|e| format!("Failed to create destination parent: {}", e))?;
+
+    // If destination exists and is an empty directory created by accept flow, remove it first.
+    if destination.exists() {
+        let is_empty_dir = destination.is_dir()
+            && std::fs::read_dir(destination)
+                .map_err(|e| format!("Failed to read destination directory: {}", e))?
+                .next()
+                .is_none();
+
+        if is_empty_dir {
+            std::fs::remove_dir(destination)
+                .map_err(|e| format!("Failed to prepare destination for linking: {}", e))?;
+        } else {
+            return Ok(false);
+        }
+    }
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(&source_canonical, destination)
+            .map_err(|e| format!("Failed to create symlink: {}", e))?;
+        return Ok(true);
+    }
+
+    #[cfg(windows)]
+    {
+        std::os::windows::fs::symlink_dir(&source_canonical, destination)
+            .map_err(|e| format!("Failed to create directory symlink: {}", e))?;
+        return Ok(true);
+    }
+
+    #[allow(unreachable_code)]
+    Ok(false)
+}
+
+fn share_relative_file_path(share_local_path: &str, note_id: &str) -> Option<String> {
+    let suffix = if share_local_path.is_empty() {
+        note_id.to_string()
+    } else if note_id == share_local_path {
+        return None;
+    } else if let Some(rest) = note_id.strip_prefix(&(share_local_path.to_string() + "/")) {
+        rest.to_string()
+    } else {
+        return None;
+    };
+
+    Some(format!("{}.md", suffix))
+}
+
+fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted: bool) {
+    let shares = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.shares.clone()
+    };
+
+    if shares.is_empty() {
+        return;
+    }
+
+    let network = state.p2p_network.lock().expect("p2p_network lock");
+    let Some(net) = network.as_ref() else { return; };
+
+    for share in shares {
+        if let Some(relative_path) = share_relative_file_path(&share.local_path, note_id) {
+            net.notify_file_change(share.id.clone(), relative_path, is_deleted);
+        }
+    }
+}
+
+/// Create a share for a folder
+#[tauri::command]
+async fn p2p_create_share(
+    folder_path: String,
+    permission: String,
+    state: State<'_, AppState>,
+) -> Result<p2p::CreateShareResult, String> {
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+
+    // Parse permission
+    let share_permission = match permission.as_str() {
+        "read_only" => p2p::SharePermission::ReadOnly,
+        "read_write" => p2p::SharePermission::ReadWrite,
+        _ => return Err("Invalid permission. Use 'read_only' or 'read_write'".to_string()),
+    };
+
+    // Get peer ID
+    let peer_id = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state
+            .peer_id
+            .clone()
+            .ok_or("P2P not started. Call p2p_start first.")?
+    };
+
+    // Resolve folder path
+    let base_path = PathBuf::from(&notes_folder);
+    let full_path = if folder_path.is_empty() {
+        base_path.clone()
+    } else {
+        base_path.join(&folder_path)
+    };
+
+    // Validate path exists
+    if !full_path.exists() {
+        return Err(format!("Folder not found: {}", folder_path));
+    }
+
+    // Get folder name
+    let folder_name = full_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("Shared")
+        .to_string();
+
+    // Create invite payload
+    let payload = p2p::create_invite_payload(
+        peer_id.clone(),
+        folder_name.clone(),
+        share_permission.clone(),
+        Some(full_path.to_string_lossy().into_owned()),
+    )
+        .map_err(|e| format!("Failed to create invite: {}", e))?;
+
+    // Encode invite code
+    let invite_code = p2p::encode_invite_code(&payload)
+        .map_err(|e| format!("Failed to encode invite: {}", e))?;
+
+    // Use the invite folder ID as the canonical cross-peer share ID.
+    let share_id = payload.folder_id.clone();
+
+    // Create shared folder record
+    let shared_folder = p2p::SharedFolder {
+        id: share_id.clone(),
+        local_path: folder_path.clone(),
+        remote_path: folder_name.clone(),
+        peer_id: peer_id.clone(),
+        peer_name: None,
+        permission: share_permission,
+        sync_status: p2p::SyncStatus::Idle,
+        last_synced: 0,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+
+    // Add to state
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.add_share(shared_folder);
+    }
+
+    if let Some(network) = state
+        .p2p_network
+        .lock()
+        .expect("p2p_network lock")
+        .as_ref()
+    {
+        network.register_share(share_id.clone(), full_path.clone(), None);
+    }
+
+    log::info!("Created share '{}' for folder '{}'", share_id, folder_path);
+
+    Ok(p2p::CreateShareResult {
+        invite_code,
+        share_id,
+    })
+}
+
+/// Accept a share invite
+#[tauri::command]
+async fn p2p_accept_share(
+    invite_code: String,
+    destination_path: String,
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> Result<p2p::SharedFolder, String> {
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+
+    // Decode invite code
+    let payload = p2p::decode_invite_code(&invite_code)
+        .map_err(|e| format!("Invalid invite code: {}", e))?;
+
+    // Get local peer ID
+    let _local_peer_id = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state
+            .peer_id
+            .clone()
+            .ok_or("P2P not started. Call p2p_start first.")?
+    };
+
+    // Validate destination path
+    let base_path = PathBuf::from(&notes_folder);
+    let dest_path = if destination_path.is_empty() {
+        base_path.join(&payload.folder_name)
+    } else {
+        base_path.join(&destination_path)
+    };
+
+    // Ensure destination directory exists
+    fs::create_dir_all(&dest_path)
+        .await
+        .map_err(|e| format!("Failed to create destination directory: {}", e))?;
+
+    if let Some(source_path) = payload.source_path.as_ref() {
+        let source = PathBuf::from(source_path);
+        if source.exists() {
+            match try_link_shared_folder(&source, &dest_path) {
+                Ok(true) => {
+                    log::info!(
+                        "Linked shared folder '{}' to '{}' for live local sync",
+                        source.display(),
+                        dest_path.display()
+                    );
+                }
+                Ok(false) => {
+                    let copied_files = bootstrap_copy_shared_folder(&source, &dest_path)?;
+                    log::info!(
+                        "Bootstrapped share '{}' with {} file(s) from '{}'",
+                        payload.folder_name,
+                        copied_files,
+                        source.display()
+                    );
+                }
+                Err(link_err) => {
+                    log::warn!(
+                        "Link mode failed for '{}' -> '{}': {}. Falling back to file copy.",
+                        source.display(),
+                        dest_path.display(),
+                        link_err
+                    );
+                    let copied_files = bootstrap_copy_shared_folder(&source, &dest_path)?;
+                    log::info!(
+                        "Bootstrapped share '{}' with {} file(s) from '{}' after link fallback",
+                        payload.folder_name,
+                        copied_files,
+                        source.display()
+                    );
+                }
+            }
+        }
+    }
+
+    // Get relative path
+    let relative_path = dest_path
+        .strip_prefix(&base_path)
+        .map_err(|e| format!("Invalid destination path: {}", e))?
+        .to_str()
+        .ok_or("Invalid UTF-8 in path")?
+        .to_string();
+
+    // Keep the same share ID across peers using the invite payload folder ID.
+    let share_id = payload.folder_id.clone();
+    let shared_folder = p2p::SharedFolder {
+        id: share_id.clone(),
+        local_path: relative_path.clone(),
+        remote_path: payload.folder_name.clone(),
+        peer_id: payload.sender_peer_id.clone(),
+        peer_name: None,
+        permission: payload.permissions.clone(),
+        sync_status: p2p::SyncStatus::DiscoveringPeer,
+        last_synced: 0,
+        created_at: chrono::Utc::now().timestamp(),
+    };
+
+    // Add to state
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.add_share(shared_folder.clone());
+    }
+
+    if let Some(network) = state
+        .p2p_network
+        .lock()
+        .expect("p2p_network lock")
+        .as_ref()
+    {
+        network.register_share(
+            share_id.clone(),
+            dest_path.clone(),
+            Some(payload.sender_peer_id.clone()),
+        );
+    }
+
+    let _ = app.emit(
+        "p2p-share-accepted",
+        serde_json::json!({
+            "share_id": share_id,
+            "local_path": relative_path,
+        }),
+    );
+
+    log::info!("Accepted share '{}' from peer '{}'", share_id, payload.sender_peer_id);
+
+    Ok(shared_folder)
+}
+
+/// List all shares
+#[tauri::command]
+async fn p2p_list_shares(state: State<'_, AppState>) -> Result<Vec<p2p::SharedFolder>, String> {
+    let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+    Ok(p2p_state.shares.clone())
+}
+
+/// Revoke a share
+#[tauri::command]
+async fn p2p_revoke_share(share_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+
+    if !p2p_state.remove_share(&share_id) {
+        return Err(format!("Share not found: {}", share_id));
+    }
+
+    if let Some(network) = state
+        .p2p_network
+        .lock()
+        .expect("p2p_network lock")
+        .as_ref()
+    {
+        network.remove_share(share_id.clone());
+    }
+
+    log::info!("Revoked share '{}'", share_id);
+
+    Ok(())
+}
+
+/// Get sync status for a share
+#[tauri::command]
+async fn p2p_get_sync_status(
+    share_id: String,
+    state: State<'_, AppState>,
+) -> Result<p2p::SyncStatus, String> {
+    let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+
+    let share = p2p_state
+        .get_share(&share_id)
+        .ok_or(format!("Share not found: {}", share_id))?;
+
+    Ok(share.sync_status.clone())
+}
+
 /// Check if a markdown file is inside the configured notes folder.
 /// If so, emit a "select-note" event to the main window and focus it, returning true.
 /// Returns false on any failure so callers can fall back to create_preview_window.
@@ -3479,10 +4179,15 @@ fn open_file_preview(app: AppHandle, path: String) -> Result<(), String> {
 fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
     let mut opened_file = false;
     let mut opened_preview = false;
-
-    for arg in args.iter().skip(1) {
+    let mut i = 1;
+    while i < args.len() {
+        let arg = &args[i];
         // Skip flags
         if arg.starts_with('-') {
+            if arg == "--profile" {
+                i += 1;
+            }
+            i += 1;
             continue;
         }
 
@@ -3519,6 +4224,8 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
                 let _ = main_window.set_focus();
             }
         }
+
+        i += 1;
     }
 
     // If no files were opened, show and focus the main window
@@ -3534,16 +4241,32 @@ fn handle_cli_args(app: &AppHandle, args: &[String], cwd: &str) -> bool {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    let app = tauri::Builder::default()
-        // Single-instance: forward CLI args from subsequent launches to the running instance
-        .plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
-            handle_cli_args(app, &args, &cwd);
-        }))
+    let startup_args: Vec<String> = std::env::args().collect();
+    let profile = extract_profile_from_args(&startup_args).or_else(current_profile_id);
+    if let Some(ref profile_id) = profile {
+        std::env::set_var(PROFILE_ENV_VAR, profile_id);
+        eprintln!("Scratch running with profile '{}'", profile_id);
+    }
+
+    let builder = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_fs::init())
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
-        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_updater::Builder::new().build());
+
+    let builder = if profile.is_some() {
+        // In profile mode we intentionally allow multiple concurrent instances
+        // so separate profiles can run side-by-side for local testing.
+        builder
+    } else {
+        // Default mode remains single-instance.
+        builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {
+            handle_cli_args(app, &args, &cwd);
+        }))
+    };
+
+    let app = builder
         .setup(|app| {
             // Load app config on startup (contains notes folder path)
             let mut app_config = load_app_config(app.handle());
@@ -3597,6 +4320,8 @@ pub fn run() {
                 file_watcher: Mutex::new(None),
                 search_index: Mutex::new(search_index),
                 debounce_map: Arc::new(Mutex::new(HashMap::new())),
+                p2p_state: Mutex::new(p2p::P2PState::new()),
+                p2p_network: Mutex::new(None),
             };
             app.manage(state);
 
@@ -3711,6 +4436,15 @@ pub fn run() {
             install_cli,
             uninstall_cli,
             get_cli_status,
+            // P2P commands
+            p2p_start,
+            p2p_stop,
+            p2p_get_status,
+            p2p_create_share,
+            p2p_accept_share,
+            p2p_list_shares,
+            p2p_revoke_share,
+            p2p_get_sync_status,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

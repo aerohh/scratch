@@ -29,6 +29,8 @@ export {
   AlertDialogAction,
   AlertDialogCancel,
 } from "./AlertDialog";
+// Share components
+export { ShareModal, QrCodeDisplay, AcceptShareModal } from "../share";
 
 // Toolbar button with active state and tooltip
 interface ToolbarButtonProps extends ButtonHTMLAttributes<HTMLButtonElement> {
