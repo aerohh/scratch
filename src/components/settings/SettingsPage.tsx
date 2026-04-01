@@ -5,19 +5,21 @@ import {
   SwatchIcon,
   KeyboardIcon,
   InfoIcon,
+  ShareIcon,
 } from "../icons";
 import { Button, IconButton } from "../ui";
 import { GeneralSettingsSection } from "./GeneralSettingsSection";
 import { AppearanceSettingsSection } from "./EditorSettingsSection";
 import { ShortcutsSettingsSection } from "./ShortcutsSettingsSection";
 import { AboutSettingsSection } from "./AboutSettingsSection";
+import { SharedFoldersSection } from "../share";
 import { mod, isMac } from "../../lib/platform";
 
 interface SettingsPageProps {
   onBack: () => void;
 }
 
-type SettingsTab = "general" | "editor" | "shortcuts" | "about";
+type SettingsTab = "general" | "editor" | "shortcuts" | "sharing" | "about";
 
 const tabs: {
   id: SettingsTab;
@@ -28,7 +30,8 @@ const tabs: {
   { id: "general", label: "General", icon: FolderIcon, shortcut: "1" },
   { id: "editor", label: "Appearance", icon: SwatchIcon, shortcut: "2" },
   { id: "shortcuts", label: "Shortcuts", icon: KeyboardIcon, shortcut: "3" },
-  { id: "about", label: "About", icon: InfoIcon, shortcut: "4" },
+  { id: "sharing", label: "Sharing", icon: ShareIcon, shortcut: "4" },
+  { id: "about", label: "About", icon: InfoIcon, shortcut: "5" },
 ];
 
 export function SettingsPage({ onBack }: SettingsPageProps) {
@@ -56,6 +59,9 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
           e.preventDefault();
           setActiveTab("shortcuts");
         } else if (e.key === "4") {
+          e.preventDefault();
+          setActiveTab("sharing");
+        } else if (e.key === "5") {
           e.preventDefault();
           setActiveTab("about");
         }
@@ -127,6 +133,7 @@ export function SettingsPage({ onBack }: SettingsPageProps) {
             {activeTab === "general" && <GeneralSettingsSection />}
             {activeTab === "editor" && <AppearanceSettingsSection />}
             {activeTab === "shortcuts" && <ShortcutsSettingsSection />}
+            {activeTab === "sharing" && <SharedFoldersSection />}
             {activeTab === "about" && <AboutSettingsSection />}
           </div>
         </div>

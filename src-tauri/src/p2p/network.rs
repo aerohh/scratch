@@ -1,5 +1,5 @@
 use crate::p2p::protocol::{SyncCodec, SYNC_PROTOCOL};
-use crate::p2p::sync::SyncEngine;
+use crate::p2p::sync::{conflict_copy_name, SyncEngine};
 use crate::p2p::types::{SharePermission, SyncMessage, SyncStatus};
 use anyhow::Result;
 use libp2p::request_response::{self, ProtocolSupport};
@@ -62,12 +62,40 @@ enum NetworkCommand {
         relative_path: String,
         is_deleted: bool,
     },
+    TriggerSync {
+        share_id: String,
+    },
     Shutdown,
 }
 
 #[derive(Debug, Default)]
 struct NetworkRuntimeState {
     connected_peers: HashSet<PeerId>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SyncProgress {
+    total: usize,
+    completed: usize,
+    has_conflicts: bool,
+}
+
+fn manifest_storage_path(notes_root: &Path, share_id: &str) -> PathBuf {
+    notes_root
+        .join(".scratch")
+        .join("sync")
+        .join(share_id)
+        .join("manifest.json")
+}
+
+async fn persist_manifest(notes_root: &Path, share_id: &str, manifest: &[crate::p2p::types::FileManifest]) {
+    let path = manifest_storage_path(notes_root, share_id);
+    if let Some(parent) = path.parent() {
+        let _ = tokio::fs::create_dir_all(parent).await;
+    }
+    if let Ok(content) = serde_json::to_vec_pretty(manifest) {
+        let _ = tokio::fs::write(path, content).await;
+    }
 }
 
 pub struct NetworkManager {
@@ -134,7 +162,8 @@ impl NetworkManager {
         tauri::async_runtime::spawn(async move {
             let mut shares: HashMap<String, ShareRuntime> = HashMap::new();
             let mut pending_manifest: HashSet<(PeerId, String)> = HashSet::new();
-            let mut pending_file_chunks: HashMap<(PeerId, String, String), Vec<Vec<u8>>> = HashMap::new();
+            let mut pending_download_target: HashMap<(PeerId, String, String), String> = HashMap::new();
+            let mut active_syncs: HashMap<(PeerId, String), SyncProgress> = HashMap::new();
 
             loop {
                 tokio::select! {
@@ -212,6 +241,33 @@ impl NetworkManager {
                                     }
                                 }
                             }
+                            NetworkCommand::TriggerSync { share_id } => {
+                                if let Some(share) = shares.get(&share_id) {
+                                    if let Some(peer) = share.remote_peer {
+                                        if runtime_state.lock().expect("runtime state lock").connected_peers.contains(&peer) {
+                                            swarm.behaviour_mut().request_response.send_request(
+                                                &peer,
+                                                SyncMessage::RequestManifest { share_id: share_id.clone() },
+                                            );
+                                        } else {
+                                            pending_manifest.insert((peer, share_id));
+                                        }
+                                    } else {
+                                        for peer in runtime_state
+                                            .lock()
+                                            .expect("runtime state lock")
+                                            .connected_peers
+                                            .iter()
+                                            .copied()
+                                        {
+                                            swarm.behaviour_mut().request_response.send_request(
+                                                &peer,
+                                                SyncMessage::RequestManifest { share_id: share_id.clone() },
+                                            );
+                                        }
+                                    }
+                                }
+                            }
                             NetworkCommand::Shutdown => break,
                         }
                     }
@@ -266,7 +322,7 @@ impl NetworkManager {
                                                     &notes_root,
                                                     &shares,
                                                     &mut swarm.behaviour_mut().request_response,
-                                                    &mut pending_file_chunks,
+                                                    &mut pending_download_target,
                                                     peer,
                                                     request,
                                                     channel,
@@ -278,7 +334,8 @@ impl NetworkManager {
                                                     &notes_root,
                                                     &shares,
                                                     &mut swarm.behaviour_mut().request_response,
-                                                    &mut pending_file_chunks,
+                                                    &mut pending_download_target,
+                                                    &mut active_syncs,
                                                     peer,
                                                     response,
                                                 ).await;
@@ -360,6 +417,11 @@ impl NetworkManager {
         });
     }
 
+    pub fn trigger_sync(&self, share_id: String) {
+        let Some(tx) = self.command_tx.as_ref() else { return; };
+        let _ = tx.send(NetworkCommand::TriggerSync { share_id });
+    }
+
     pub fn peer_id(&self) -> Option<&str> {
         self.peer_id.as_deref()
     }
@@ -411,7 +473,7 @@ async fn handle_inbound_request(
     notes_root: &Path,
     shares: &HashMap<String, ShareRuntime>,
     behaviour: &mut request_response::Behaviour<SyncCodec>,
-    _pending_file_chunks: &mut HashMap<(PeerId, String, String), Vec<Vec<u8>>>,
+    _pending_download_target: &mut HashMap<(PeerId, String, String), String>,
     peer: PeerId,
     request: SyncMessage,
     channel: request_response::ResponseChannel<SyncMessage>,
@@ -422,6 +484,7 @@ async fn handle_inbound_request(
                 let engine = SyncEngine::new(share.local_path.clone());
                 match engine.generate_manifest().await {
                     Ok(files) => {
+                        persist_manifest(notes_root, &share_id, &files).await;
                         let _ = behaviour.send_response(
                             channel,
                             SyncMessage::Manifest { share_id, files },
@@ -541,7 +604,8 @@ async fn handle_inbound_response(
     notes_root: &Path,
     shares: &HashMap<String, ShareRuntime>,
     behaviour: &mut request_response::Behaviour<SyncCodec>,
-    _pending_file_chunks: &mut HashMap<(PeerId, String, String), Vec<Vec<u8>>>,
+    pending_download_target: &mut HashMap<(PeerId, String, String), String>,
+    active_syncs: &mut HashMap<(PeerId, String), SyncProgress>,
     peer: PeerId,
     response: SyncMessage,
 ) {
@@ -551,11 +615,17 @@ async fn handle_inbound_response(
                 let engine = SyncEngine::new(share.local_path.clone());
                 if let Ok(local_manifest) = engine.generate_manifest().await {
                     let diff = engine.compare_manifests(&local_manifest, &files);
+                    persist_manifest(notes_root, &share_id, &files).await;
+                    let _ = app.emit("p2p-sync-start", serde_json::json!({ "share_id": share_id }));
+
+                    let mut total_requests = 0usize;
+                    let has_conflicts = !diff.conflicts.is_empty();
                     if !share.is_owner && matches!(share.permission, SharePermission::ReadOnly) {
                         let remote_map: HashMap<_, _> = files.iter().map(|m| (&m.path, m)).collect();
                         for local_file in &local_manifest {
                             if let Some(remote_file) = remote_map.get(&local_file.path) {
                                 if local_file.hash != remote_file.hash {
+                                    total_requests += 1;
                                     behaviour.send_request(
                                         &peer,
                                         SyncMessage::RequestFile {
@@ -570,7 +640,22 @@ async fn handle_inbound_response(
                             }
                         }
                     } else {
+                        for conflict in &diff.conflicts {
+                            total_requests += 1;
+                            pending_download_target.insert(
+                                (peer, share_id.clone(), conflict.path.clone()),
+                                conflict_copy_name(&conflict.path),
+                            );
+                            behaviour.send_request(
+                                &peer,
+                                SyncMessage::RequestFile {
+                                    share_id: share_id.clone(),
+                                    path: conflict.path.clone(),
+                                },
+                            );
+                        }
                         for path in diff.to_download {
+                            total_requests += 1;
                             behaviour.send_request(
                                 &peer,
                                 SyncMessage::RequestFile {
@@ -579,6 +664,31 @@ async fn handle_inbound_response(
                                 },
                             );
                         }
+                    }
+
+                    if total_requests == 0 {
+                        let status = if has_conflicts {
+                            SyncStatus::Conflict
+                        } else {
+                            SyncStatus::Synced
+                        };
+                        let _ = app.emit("p2p-sync-status", serde_json::json!({
+                            "share_id": share_id,
+                            "status": status,
+                        }));
+                        let _ = app.emit("p2p-sync-complete", serde_json::json!({
+                            "share_id": share_id,
+                            "has_conflicts": has_conflicts,
+                        }));
+                    } else {
+                        active_syncs.insert(
+                            (peer, share_id.clone()),
+                            SyncProgress {
+                                total: total_requests,
+                                completed: 0,
+                                has_conflicts,
+                            },
+                        );
                     }
                 }
             }
@@ -594,16 +704,65 @@ async fn handle_inbound_response(
                 return;
             }
             if let Some(share) = shares.get(&share_id) {
-                if let Some(full_path) = resolve_share_file(&share.local_path, &path) {
+                let target_relative = pending_download_target
+                    .remove(&(peer, share_id.clone(), path.clone()))
+                    .unwrap_or_else(|| path.clone());
+
+                if let Some(full_path) = resolve_share_file(&share.local_path, &target_relative) {
                     if let Some(parent) = full_path.parent() {
                         let _ = tokio::fs::create_dir_all(parent).await;
                     }
                     if tokio::fs::write(&full_path, data).await.is_ok() {
                         emit_note_change(app, notes_root, &full_path, "modified").await;
-                        let _ = app.emit("p2p-sync-status", serde_json::json!({
-                            "share_id": share_id,
-                            "status": SyncStatus::Synced,
-                        }));
+                        if let Ok(updated_manifest) = SyncEngine::new(share.local_path.clone()).generate_manifest().await {
+                            persist_manifest(notes_root, &share_id, &updated_manifest).await;
+                        }
+
+                        if let Some(progress) = active_syncs.get_mut(&(peer, share_id.clone())) {
+                            progress.completed += 1;
+                            let pct = if progress.total == 0 {
+                                100
+                            } else {
+                                ((progress.completed * 100) / progress.total).min(100)
+                            };
+                            let _ = app.emit("p2p-sync-progress", serde_json::json!({
+                                "share_id": share_id,
+                                "progress": pct,
+                                "file": target_relative,
+                            }));
+
+                            if progress.completed >= progress.total {
+                                let has_conflicts = progress.has_conflicts;
+                                let status = if has_conflicts {
+                                    SyncStatus::Conflict
+                                } else {
+                                    SyncStatus::Synced
+                                };
+                                let _ = app.emit("p2p-sync-status", serde_json::json!({
+                                    "share_id": share_id,
+                                    "status": status,
+                                }));
+                                let _ = app.emit("p2p-sync-complete", serde_json::json!({
+                                    "share_id": share_id,
+                                    "has_conflicts": has_conflicts,
+                                }));
+                                active_syncs.remove(&(peer, share_id.clone()));
+                            }
+                        } else {
+                            let _ = app.emit("p2p-sync-progress", serde_json::json!({
+                                "share_id": share_id,
+                                "progress": 100,
+                                "file": target_relative,
+                            }));
+                            let _ = app.emit("p2p-sync-status", serde_json::json!({
+                                "share_id": share_id,
+                                "status": SyncStatus::Synced,
+                            }));
+                            let _ = app.emit("p2p-sync-complete", serde_json::json!({
+                                "share_id": share_id,
+                                "has_conflicts": false,
+                            }));
+                        }
                     }
                 }
             }

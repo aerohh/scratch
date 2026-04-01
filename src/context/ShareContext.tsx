@@ -15,7 +15,32 @@ import type {
   P2PStatus,
   SharePermission,
   CreateShareResult,
+  SyncStatus,
 } from "../types/share";
+
+function normalizeSyncStatus(status: unknown): SyncStatus {
+  if (typeof status === "string") {
+    const normalized = status.toLowerCase();
+    if (
+      normalized === "idle" ||
+      normalized === "discovering_peer" ||
+      normalized === "connecting" ||
+      normalized === "syncing" ||
+      normalized === "synced" ||
+      normalized === "conflict" ||
+      normalized === "error"
+    ) {
+      return normalized;
+    }
+    return "error";
+  }
+
+  if (status && typeof status === "object" && "Error" in (status as Record<string, unknown>)) {
+    return "error";
+  }
+
+  return "error";
+}
 
 interface ShareContextValue {
   // State
@@ -25,6 +50,7 @@ interface ShareContextValue {
   isLoading: boolean;
   isCreating: boolean;
   isAccepting: boolean;
+  syncProgress: Record<string, { progress: number; file?: string }>;
   error: string | null;
 
   // Actions
@@ -33,6 +59,7 @@ interface ShareContextValue {
   createShare: (folderPath: string, permission: SharePermission) => Promise<CreateShareResult | null>;
   acceptShare: (inviteCode: string, destinationPath: string) => Promise<SharedFolder | null>;
   revokeShare: (shareId: string) => Promise<boolean>;
+  manualSync: (shareId: string) => Promise<boolean>;
   refreshShares: () => Promise<void>;
   refreshP2PStatus: () => Promise<void>;
   clearError: () => void;
@@ -46,6 +73,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(false);
   const [isCreating, setIsCreating] = useState(false);
   const [isAccepting, setIsAccepting] = useState(false);
+  const [syncProgress, setSyncProgress] = useState<Record<string, { progress: number; file?: string }>>({});
   const [error, setError] = useState<string | null>(null);
 
   // Use refs to avoid stale closure issues
@@ -199,6 +227,20 @@ export function ShareProvider({ children }: { children: ReactNode }) {
     }
   }, [refreshShares]);
 
+  // Manual sync
+  const manualSync = useCallback(async (shareId: string): Promise<boolean> => {
+    setError(null);
+    try {
+      await ensureP2PRunning();
+      await shareService.manualSync(shareId);
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to trigger manual sync";
+      setError(message);
+      return false;
+    }
+  }, [ensureP2PRunning]);
+
   // Initialize P2P on mount
   useEffect(() => {
     const initP2P = async () => {
@@ -222,14 +264,49 @@ export function ShareProvider({ children }: { children: ReactNode }) {
     // Listen for sync status changes
     listen("p2p-sync-status", (event: unknown) => {
       // Update share status in list
-      const data = event as { payload: { share_id: string; status: string } };
+      const data = event as { payload: { share_id: string; status: unknown } };
+      const status = normalizeSyncStatus(data.payload.status);
       setShares((prev) =>
         prev.map((share) =>
           share.id === data.payload.share_id
-            ? { ...share, sync_status: data.payload.status as any }
+            ? { ...share, sync_status: status }
             : share
         )
       );
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-sync-start", (event: unknown) => {
+      const data = event as { payload: { share_id: string } };
+      setSyncProgress((prev) => ({
+        ...prev,
+        [data.payload.share_id]: { progress: 0 },
+      }));
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-sync-progress", (event: unknown) => {
+      const data = event as { payload: { share_id: string; progress: number; file?: string } };
+      setSyncProgress((prev) => ({
+        ...prev,
+        [data.payload.share_id]: {
+          progress: data.payload.progress ?? 0,
+          file: data.payload.file,
+        },
+      }));
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-sync-complete", (event: unknown) => {
+      const data = event as { payload: { share_id: string } };
+      setSyncProgress((prev) => ({
+        ...prev,
+        [data.payload.share_id]: { progress: 100 },
+      }));
+      setTimeout(() => {
+        setSyncProgress((prev) => {
+          const next = { ...prev };
+          delete next[data.payload.share_id];
+          return next;
+        });
+      }, 2000);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     // Listen for peer events
@@ -257,12 +334,14 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isLoading,
       isCreating,
       isAccepting,
+      syncProgress,
       error,
       startP2P,
       stopP2P,
       createShare,
       acceptShare,
       revokeShare,
+      manualSync,
       refreshShares,
       refreshP2PStatus,
       clearError,
@@ -274,12 +353,14 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isLoading,
       isCreating,
       isAccepting,
+      syncProgress,
       error,
       startP2P,
       stopP2P,
       createShare,
       acceptShare,
       revokeShare,
+      manualSync,
       refreshShares,
       refreshP2PStatus,
       clearError,

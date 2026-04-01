@@ -18,6 +18,7 @@ export interface SharedFolder {
   peer_id: string;
   peer_name: string | null;
   permission: SharePermission;
+  is_owner: boolean;
   sync_status: SyncStatus;
   last_synced: number;
   created_at: number;

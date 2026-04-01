@@ -77,6 +77,28 @@ export async function getSyncStatus(shareId: string): Promise<SyncStatus> {
 }
 
 /**
+ * Trigger a manual sync for a share
+ */
+export async function manualSync(shareId: string): Promise<void> {
+  return invoke("p2p_manual_sync", { shareId });
+}
+
+/**
+ * Resolve sync conflict for a shared file
+ */
+export async function resolveConflict(
+  shareId: string,
+  filePath: string,
+  resolution: "keep_local" | "keep_remote" | "keep_both"
+): Promise<void> {
+  return invoke("p2p_resolve_conflict", {
+    shareId,
+    filePath,
+    resolution,
+  });
+}
+
+/**
  * Validate an invite code format
  */
 export async function validateInviteCode(inviteCode: string): Promise<boolean> {

@@ -779,6 +779,31 @@ fn save_settings(notes_folder: &str, settings: &Settings) -> Result<()> {
     Ok(())
 }
 
+fn get_shares_path(notes_folder: &str) -> PathBuf {
+    let scratch_dir = PathBuf::from(notes_folder).join(".scratch");
+    std::fs::create_dir_all(&scratch_dir).ok();
+    scratch_dir.join("shares.json")
+}
+
+fn load_p2p_shares(notes_folder: &str) -> Vec<p2p::SharedFolder> {
+    let path = get_shares_path(notes_folder);
+    if !path.exists() {
+        return Vec::new();
+    }
+
+    std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|content| serde_json::from_str::<Vec<p2p::SharedFolder>>(&content).ok())
+        .unwrap_or_default()
+}
+
+fn save_p2p_shares(notes_folder: &str, shares: &[p2p::SharedFolder]) -> Result<()> {
+    let path = get_shares_path(notes_folder);
+    let content = serde_json::to_string_pretty(shares)?;
+    std::fs::write(path, content)?;
+    Ok(())
+}
+
 // Clean up old entries from debounce map (entries older than 5 seconds)
 fn cleanup_debounce_map(map: &Mutex<HashMap<PathBuf, Instant>>) {
     let mut map = map.lock().expect("debounce map mutex");
@@ -842,6 +867,12 @@ fn initialize_notes_folder(app: &AppHandle, path_buf: &PathBuf, state: &AppState
     {
         let mut current_settings = state.settings.write().expect("settings write lock");
         *current_settings = settings;
+    }
+
+    // Load persisted P2P shares for this notes folder
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.shares = load_p2p_shares(&normalized_path);
     }
 
     // Save app config to disk
@@ -3567,8 +3598,37 @@ async fn p2p_start(app: AppHandle, state: State<'_, AppState>) -> Result<p2p::P2
     let net_manager = net_manager.get_or_insert_with(p2p::NetworkManager::new);
 
     let peer_id = net_manager
-        .start(app, PathBuf::from(notes_folder))
+        .start(app, PathBuf::from(&notes_folder))
         .map_err(|e| format!("Failed to start P2P network: {}", e))?;
+
+    let shares_to_register = p2p_state.shares.clone();
+    let notes_root = PathBuf::from(&notes_folder);
+    for share in shares_to_register {
+        match resolve_share_folder_path(&notes_root, &share.local_path) {
+            Ok(full_path) => {
+                let remote_peer = if share.is_owner {
+                    None
+                } else {
+                    Some(share.peer_id.clone())
+                };
+                net_manager.register_share(
+                    share.id.clone(),
+                    full_path,
+                    remote_peer,
+                    share.permission.clone(),
+                    share.is_owner,
+                );
+            }
+            Err(err) => {
+                log::warn!(
+                    "Skipping persisted share '{}' due to invalid path '{}': {}",
+                    share.id,
+                    share.local_path,
+                    err
+                );
+            }
+        }
+    }
 
     p2p_state.set_running(true);
     p2p_state.set_peer_id(peer_id.to_string());
@@ -3700,10 +3760,27 @@ fn share_relative_file_path(share_local_path: &str, note_id: &str) -> Option<Str
     Some(format!("{}.md", suffix))
 }
 
-fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted: bool) {
-    let (shares, local_peer_id) = {
+fn persist_p2p_shares(state: &AppState) -> Result<(), String> {
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set".to_string())?
+    };
+
+    let shares = {
         let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
-        (p2p_state.shares.clone(), p2p_state.peer_id.clone())
+        p2p_state.shares.clone()
+    };
+
+    save_p2p_shares(&notes_folder, &shares).map_err(|e| format!("Failed to persist shares: {}", e))
+}
+
+fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted: bool) {
+    let shares = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.shares.clone()
     };
 
     if shares.is_empty() {
@@ -3714,11 +3791,7 @@ fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted
     let Some(net) = network.as_ref() else { return; };
 
     for share in shares {
-        let is_owner = local_peer_id
-            .as_deref()
-            .map(|id| id == share.peer_id)
-            .unwrap_or(false);
-        let can_send_changes = is_owner || matches!(share.permission, p2p::SharePermission::ReadWrite);
+        let can_send_changes = share.is_owner || matches!(share.permission, p2p::SharePermission::ReadWrite);
         if !can_send_changes {
             continue;
         }
@@ -3803,6 +3876,7 @@ async fn p2p_create_share(
         peer_id: peer_id.clone(),
         peer_name: None,
         permission: share_permission.clone(),
+        is_owner: true,
         sync_status: p2p::SyncStatus::Idle,
         last_synced: 0,
         created_at: chrono::Utc::now().timestamp(),
@@ -3816,6 +3890,7 @@ async fn p2p_create_share(
         }
         p2p_state.add_share(shared_folder);
     }
+    persist_p2p_shares(&state)?;
 
     if let Some(network) = state
         .p2p_network
@@ -3900,6 +3975,7 @@ async fn p2p_accept_share(
         peer_id: payload.sender_peer_id.clone(),
         peer_name: None,
         permission: payload.permissions.clone(),
+        is_owner: false,
         sync_status: p2p::SyncStatus::DiscoveringPeer,
         last_synced: 0,
         created_at: chrono::Utc::now().timestamp(),
@@ -3913,6 +3989,7 @@ async fn p2p_accept_share(
         }
         p2p_state.add_share(shared_folder.clone());
     }
+    persist_p2p_shares(&state)?;
 
     if let Some(network) = state
         .p2p_network
@@ -3957,7 +4034,8 @@ async fn p2p_revoke_share(share_id: String, state: State<'_, AppState>) -> Resul
     if !p2p_state.remove_share(&share_id) {
         return Err(format!("Share not found: {}", share_id));
     }
-
+    drop(p2p_state);
+    persist_p2p_shares(&state)?;
     if let Some(network) = state
         .p2p_network
         .lock()
@@ -3985,6 +4063,118 @@ async fn p2p_get_sync_status(
         .ok_or(format!("Share not found: {}", share_id))?;
 
     Ok(share.sync_status.clone())
+}
+
+/// Manually trigger sync for a share
+#[tauri::command]
+async fn p2p_manual_sync(share_id: String, state: State<'_, AppState>) -> Result<(), String> {
+    {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        if p2p_state.get_share(&share_id).is_none() {
+            return Err(format!("Share not found: {}", share_id));
+        }
+    }
+
+    if let Some(network) = state
+        .p2p_network
+        .lock()
+        .expect("p2p_network lock")
+        .as_ref()
+    {
+        network.trigger_sync(share_id);
+        Ok(())
+    } else {
+        Err("P2P network is not running".to_string())
+    }
+}
+
+/// Resolve conflict for a shared file
+#[tauri::command]
+async fn p2p_resolve_conflict(
+    share_id: String,
+    file_path: String,
+    resolution: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    if file_path.contains('\\') {
+        return Err("Invalid file path".to_string());
+    }
+    let rel = Path::new(&file_path);
+    if rel.is_absolute() || rel.components().any(|c| matches!(c, std::path::Component::ParentDir)) {
+        return Err("Invalid file path".to_string());
+    }
+
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+    let base_path = PathBuf::from(notes_folder);
+
+    let share = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state
+            .get_share(&share_id)
+            .cloned()
+            .ok_or(format!("Share not found: {}", share_id))?
+    };
+    let share_path = resolve_share_folder_path(&base_path, &share.local_path)?;
+    let local_path = share_path.join(rel);
+    let conflict_path = share_path.join(p2p::sync::conflict_copy_name(&file_path));
+
+    match resolution.as_str() {
+        "keep_local" => {
+            if conflict_path.exists() {
+                fs::remove_file(&conflict_path)
+                    .await
+                    .map_err(|e| format!("Failed to remove conflict copy: {}", e))?;
+            }
+        }
+        "keep_remote" => {
+            if !conflict_path.exists() {
+                return Err("Conflict copy not found. Run sync again to fetch remote conflict copy.".to_string());
+            }
+            if let Some(parent) = local_path.parent() {
+                fs::create_dir_all(parent)
+                    .await
+                    .map_err(|e| format!("Failed to prepare file path: {}", e))?;
+            }
+            if local_path.exists() {
+                fs::remove_file(&local_path)
+                    .await
+                    .map_err(|e| format!("Failed to replace local file: {}", e))?;
+            }
+            fs::rename(&conflict_path, &local_path)
+                .await
+                .map_err(|e| format!("Failed to promote remote version: {}", e))?;
+        }
+        "keep_both" => {
+            if !conflict_path.exists() {
+                if !local_path.exists() {
+                    return Err("No local file available for keep_both".to_string());
+                }
+                if let Some(parent) = conflict_path.parent() {
+                    fs::create_dir_all(parent)
+                        .await
+                        .map_err(|e| format!("Failed to prepare conflict path: {}", e))?;
+                }
+                fs::copy(&local_path, &conflict_path)
+                    .await
+                    .map_err(|e| format!("Failed to create conflict copy: {}", e))?;
+            }
+        }
+        _ => return Err("Invalid resolution. Use keep_local, keep_remote, or keep_both".to_string()),
+    }
+
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state.update_share_status(&share_id, p2p::SyncStatus::Synced);
+    }
+    persist_p2p_shares(&state)?;
+
+    Ok(())
 }
 
 /// Check if a markdown file is inside the configured notes folder.
@@ -4247,6 +4437,12 @@ pub fn run() {
                 None
             };
 
+            let persisted_shares = app_config
+                .notes_folder
+                .as_ref()
+                .map(|folder| load_p2p_shares(folder))
+                .unwrap_or_default();
+
             let state = AppState {
                 app_config: RwLock::new(app_config),
                 settings: RwLock::new(settings),
@@ -4254,7 +4450,11 @@ pub fn run() {
                 file_watcher: Mutex::new(None),
                 search_index: Mutex::new(search_index),
                 debounce_map: Arc::new(Mutex::new(HashMap::new())),
-                p2p_state: Mutex::new(p2p::P2PState::new()),
+                p2p_state: Mutex::new({
+                    let mut p2p_state = p2p::P2PState::new();
+                    p2p_state.shares = persisted_shares;
+                    p2p_state
+                }),
                 p2p_network: Mutex::new(None),
             };
             app.manage(state);
@@ -4379,6 +4579,8 @@ pub fn run() {
             p2p_list_shares,
             p2p_revoke_share,
             p2p_get_sync_status,
+            p2p_manual_sync,
+            p2p_resolve_conflict,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

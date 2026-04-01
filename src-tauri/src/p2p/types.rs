@@ -58,6 +58,8 @@ pub struct SharedFolder {
     pub peer_id: String,
     pub peer_name: Option<String>,
     pub permission: SharePermission,
+    #[serde(default)]
+    pub is_owner: bool,
     pub sync_status: SyncStatus,
     pub last_synced: i64,
     pub created_at: i64,
