@@ -1,6 +1,7 @@
 use anyhow::Result;
 use base64::Engine;
 use libp2p::identity::Keypair;
+use libp2p::PeerId;
 use notify::{Config, RecommendedWatcher, RecursiveMode, Watcher};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -3682,15 +3683,22 @@ async fn p2p_start(app: AppHandle, state: State<'_, AppState>) -> Result<p2p::P2
     for share in shares_to_register {
         match resolve_share_folder_path(&notes_root, &share.local_path) {
             Ok(full_path) => {
-                let remote_peer = if share.is_owner {
-                    None
+                // Build initial peers list from share members
+                let initial_peer_ids: Vec<String> = if share.is_owner {
+                    // Owner includes all members as initial peers
+                    share.members.iter()
+                        .map(|m| m.peer_id.clone())
+                        .chain(std::iter::once(share.peer_id.clone())) // Include original peer_id too
+                        .collect()
                 } else {
-                    Some(share.peer_id.clone())
+                    // Non-owner just has the original peer
+                    vec![share.peer_id.clone()]
                 };
+
                 net_manager.register_share(
                     share.id.clone(),
                     full_path,
-                    remote_peer,
+                    initial_peer_ids,
                     share.permission.clone(),
                     share.is_owner,
                 );
@@ -3972,7 +3980,7 @@ fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted
         }
 
         if let Some(relative_path) = share_relative_file_path(&share.local_path, note_id) {
-            net.notify_file_change(share.id.clone(), relative_path, is_deleted);
+            net.notify_file_change(share.id.clone(), relative_path, is_deleted, true);  // Broadcast for multi-peer mesh
         }
     }
 }
@@ -4055,6 +4063,7 @@ async fn p2p_create_share(
         sync_status: p2p::SyncStatus::Idle,
         last_synced: 0,
         created_at: chrono::Utc::now().timestamp(),
+        members: vec![],
     };
 
     // Add to state
@@ -4076,7 +4085,7 @@ async fn p2p_create_share(
         network.register_share(
             share_id.clone(),
             full_path.clone(),
-            None,
+            vec![], // No initial peers for a new share (owner waits for others to join)
             share_permission,
             true,
         );
@@ -4161,6 +4170,7 @@ async fn p2p_accept_share(
         sync_status: p2p::SyncStatus::DiscoveringPeer,
         last_synced: 0,
         created_at: chrono::Utc::now().timestamp(),
+        members: vec![],
     };
 
     // Add to state
@@ -4182,7 +4192,7 @@ async fn p2p_accept_share(
         network.register_share(
             share_id.clone(),
             dest_path.clone(),
-            Some(payload.sender_peer_id.clone()),
+            vec![payload.sender_peer_id.clone()], // Initial peer is the sender
             payload.permissions.clone(),
             false,
         );
@@ -4395,6 +4405,230 @@ async fn p2p_resolve_conflict(
     persist_p2p_shares(&state)?;
 
     Ok(())
+}
+
+// ============ Phase 3: WAN + Multi-peer Commands ============
+
+/// Discover available peers via Kademlia DHT
+#[tauri::command]
+async fn p2p_discover_peers(state: State<'_, AppState>) -> Result<Vec<p2p::PeerInfo>, String> {
+    let network = state.p2p_network.lock().expect("p2p_network lock");
+    let Some(manager) = network.as_ref() else {
+        return Err("P2P network not running".to_string());
+    };
+
+    // For now, return connected peers as discovered peers
+    // In a full implementation, this would query the Kademlia DHT
+    let connected_peers = manager.connected_peers();
+    if connected_peers == 0 {
+        return Ok(vec![]);
+    }
+
+    // This is a simplified implementation - in production, you'd query the Kademlia DHT
+    // for peers that might be available for a specific share
+    Ok(vec![])
+}
+
+/// Get connection information for a specific share
+#[tauri::command]
+async fn p2p_get_connection_info(
+    share_id: String,
+    state: State<'_, AppState>,
+) -> Result<p2p::ConnectionInfo, String> {
+    let share = {
+        let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        p2p_state
+            .get_share(&share_id)
+            .cloned()
+            .ok_or(format!("Share not found: {}", share_id))?
+    };
+
+    // Get connection metrics from network manager for the best connected peer
+    let (connection_type, latency_ms, bandwidth_bps) = if let Some(network) = state.p2p_network.lock().expect("p2p_network lock").as_ref() {
+        // Try to get metrics for any connected peer in this share
+        let mut best_metrics = None;
+        for member in &share.members {
+            if let Ok(peer_id) = member.peer_id.parse::<PeerId>() {
+                if let Some(metrics) = network.get_connection_metrics(&peer_id) {
+                    best_metrics = Some(metrics);
+                    break;
+                }
+            }
+        }
+
+        if let Some(metrics) = best_metrics {
+            (metrics.connection_type, metrics.latency_ms, metrics.bandwidth_bps)
+        } else {
+            // Fallback: determine from sync status
+            let conn_type = if share.sync_status.is_synced() || share.sync_status == p2p::SyncStatus::Idle {
+                p2p::ConnectionType::DirectTcp
+            } else {
+                p2p::ConnectionType::Relay
+            };
+            (conn_type, None, None)
+        }
+    } else {
+        (p2p::ConnectionType::DirectTcp, None, None)
+    };
+
+    Ok(p2p::ConnectionInfo {
+        share_id,
+        connection_type,
+        latency_ms,
+        bandwidth_bps,
+    })
+}
+
+/// Add a member to an existing share (multi-peer sharing)
+#[tauri::command]
+async fn p2p_add_member(
+    share_id: String,
+    invite_code: String,
+    state: State<'_, AppState>,
+) -> Result<p2p::ShareMember, String> {
+    // Decode the invite code to get peer info
+    let payload = p2p::decode_invite_code(&invite_code)
+        .map_err(|e| format!("Failed to decode invite code: {}", e))?;
+
+    let new_member = {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        let share = p2p_state
+            .get_share_mut(&share_id)
+            .ok_or(format!("Share not found: {}", share_id))?;
+
+        if !share.is_owner {
+            return Err("Only the share owner can add members".to_string());
+        }
+
+        // Check if this peer is already a member
+        if share.members.iter().any(|m| m.peer_id == payload.sender_peer_id) {
+            return Err("Peer is already a member of this share".to_string());
+        }
+
+        // Create new member entry
+        let new_member = p2p::ShareMember {
+            peer_id: payload.sender_peer_id.clone(),
+            peer_name: None,
+            permission: payload.permissions.clone(),
+            joined_at: chrono::Utc::now().timestamp(),
+            last_seen: chrono::Utc::now().timestamp(),
+        };
+
+        share.members.push(new_member.clone());
+        new_member
+    };
+
+    persist_p2p_shares(&state)?;
+
+    // Notify network manager about the new peer
+    if let Some(network) = state.p2p_network.lock().expect("p2p_network lock").as_ref() {
+        network.add_peer_to_share(share_id.clone(), payload.sender_peer_id.clone());
+    }
+
+    Ok(new_member)
+}
+
+/// Remove a member from a share
+#[tauri::command]
+async fn p2p_remove_member(
+    share_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let peer_to_remove = peer_id.clone();
+
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        let share = p2p_state
+            .get_share_mut(&share_id)
+            .ok_or(format!("Share not found: {}", share_id))?;
+
+        if !share.is_owner {
+            return Err("Only the share owner can remove members".to_string());
+        }
+
+        // Find and remove the member
+        let original_len = share.members.len();
+        share.members.retain(|m| m.peer_id != peer_id);
+
+        if share.members.len() == original_len {
+            return Err("Member not found in share".to_string());
+        }
+    }
+
+    persist_p2p_shares(&state)?;
+
+    // Notify network manager to remove the peer from the share
+    if let Some(network) = state.p2p_network.lock().expect("p2p_network lock").as_ref() {
+        network.remove_peer_from_share(share_id, peer_to_remove);
+    }
+
+    Ok(())
+}
+
+/// Update a member's permission
+#[tauri::command]
+async fn p2p_update_member_permission(
+    share_id: String,
+    peer_id: String,
+    permission: String,
+    state: State<'_, AppState>,
+) -> Result<(), String> {
+    let share_permission = match permission.as_str() {
+        "read_only" => p2p::SharePermission::ReadOnly,
+        "read_write" => p2p::SharePermission::ReadWrite,
+        _ => return Err("Invalid permission. Use read_only or read_write".to_string()),
+    };
+
+    {
+        let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        let share = p2p_state
+            .get_share_mut(&share_id)
+            .ok_or(format!("Share not found: {}", share_id))?;
+
+        if !share.is_owner {
+            return Err("Only the share owner can update permissions".to_string());
+        }
+
+        let member = share
+            .members
+            .iter_mut()
+            .find(|m| m.peer_id == peer_id)
+            .ok_or("Member not found in share")?;
+
+        member.permission = share_permission.clone();
+    }
+
+    persist_p2p_shares(&state)?;
+
+    // Notify network manager about the permission change
+    if let Some(network) = state.p2p_network.lock().expect("p2p_network lock").as_ref() {
+        network.update_peer_permission(share_id, peer_id, share_permission);
+    }
+
+    Ok(())
+}
+
+/// Get activity log for a share
+#[tauri::command]
+async fn p2p_get_activity_log(
+    share_id: String,
+    limit: Option<usize>,
+    state: State<'_, AppState>,
+) -> Result<Vec<p2p::ActivityEntry>, String> {
+    let notes_folder = {
+        let app_config = state.app_config.read().expect("app_config read lock");
+        app_config
+            .notes_folder
+            .clone()
+            .ok_or("Notes folder not set")?
+    };
+
+    let activity_tracker = p2p::ActivityTracker::new(std::path::PathBuf::from(notes_folder));
+    activity_tracker
+        .get_activity(&share_id, limit)
+        .await
+        .map_err(|e| format!("Failed to get activity log: {}", e))
 }
 
 /// Check if a markdown file is inside the configured notes folder.
@@ -4802,6 +5036,12 @@ pub fn run() {
             p2p_manual_sync,
             p2p_update_share_state,
             p2p_resolve_conflict,
+            p2p_discover_peers,
+            p2p_get_connection_info,
+            p2p_add_member,
+            p2p_remove_member,
+            p2p_update_member_permission,
+            p2p_get_activity_log,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application");

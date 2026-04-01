@@ -1,7 +1,7 @@
 # P2P Folder Sharing Feature - Requirements & Specification
 
-> **Status:** Implementation Planned
-> **Last Updated:** 2026-04-01
+> **Status:** All 3 Phases Implemented
+> **Last Updated:** 2026-04-02
 > **Phases:** 3 (9 weeks total)
 
 ---
@@ -13,11 +13,13 @@ Enable users to share folders with other users across LAN and WAN via peer-to-pe
 ### Key Features
 
 - Share folders via invite codes (text + QR code)
-- P2P sync using libp2p (LAN via mDNS, WAN via WebRTC)
+- P2P sync using libp2p (LAN via mDNS, WAN via TCP + Relay with Kademlia DHT)
+- All-to-all mesh topology (any peer can sync with any other peer)
 - Automatic bidirectional sync with conflict detection
 - Shared folders management in settings
 - End-to-end encryption (Noise protocol)
 - Last-write-wins conflict resolution with conflict copies
+- Multi-peer sharing with per-member permissions
 
 ---
 
@@ -30,9 +32,10 @@ Enable users to share folders with other users across LAN and WAN via peer-to-pe
 | P2P Networking | libp2p (Rust) |
 | Encryption | Noise Protocol (via libp2p) |
 | LAN Discovery | mDNS |
-| WAN Transport | WebRTC + Relay |
+| WAN Transport | TCP + Relay (via Kademlia DHT + AutoNAT) |
 | QR Codes | qrcode.react (Frontend) |
 | Serialization | serde/bincode (Rust) |
+| Compression | zstd (Week 9) |
 
 ### Data Flow
 
@@ -252,30 +255,30 @@ async fn p2p_resolve_conflict(
 
 ---
 
-### Phase 3: WAN + Polish (Weeks 7-9)
+### Phase 3: WAN + Multi-peer + Polish (Weeks 7-9)
 
-**Goal:** WebRTC transport, relay server, multi-peer sharing, polish.
+**Goal:** TCP WAN connections with Kademlia DHT, all-to-all mesh sharing, performance optimizations.
 
-#### Week 7: WebRTC & NAT Traversal
+#### Week 7: TCP WAN & NAT Traversal
 
 **Tasks:**
-1. Add WebRTC transport to libp2p
-2. Implement relay client support
-3. Add Auto NAT traversal
-4. Test WAN connections
+1. Add Kademlia DHT to libp2p for WAN peer discovery
+2. Implement proper AutoNAT configuration
+3. Add relay client fallback for NAT traversal
+4. Test WAN connections across different networks
 
 **Deliverables:**
-- WebRTC transport integration
-- Relay server configuration
-- Auto NAT traversal
-- WAN peer discovery
+- Kademlia DHT integration for peer discovery
+- AutoNAT properly configured with public relay servers
+- TCP relay client fallback connections
+- WAN peer discovery and connection
 
 **Additional libp2p features:**
 ```toml
 libp2p = { version = "0.54", features = [
     # ... existing features ...
-    "webrtc",            # WebRTC transport
-    "kad",               # Kademlia DHT
+    "kad",               # Kademlia DHT for WAN peer discovery
+    "dcvr",              # DHT content routing for provider discovery
 ] }
 ```
 
@@ -283,42 +286,98 @@ libp2p = { version = "0.54", features = [
 ```rust
 #[tauri::command]
 async fn p2p_discover_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String>
+
+#[tauri::command]
+async fn p2p_get_connection_info(share_id: String, state: State<'_, AppState>) -> Result<ConnectionInfo, String>
 ```
 
-#### Week 8: Multi-peer Sharing
+#### Week 8: Multi-peer Mesh Sharing
 
 **Tasks:**
-1. Support sharing folder with multiple people
-2. Implement Kademlia DHT for peer discovery
-3. Add connection fallback strategies
-4. Multi-peer sync coordination
+1. Update ShareRuntime to support multiple peers per share
+2. Implement all-to-all mesh sync topology (any peer can sync with any other)
+3. Add GossipSub for broadcasting file changes to all peers
+4. Implement per-member permission management
+5. Create activity log tracking
 
 **Deliverables:**
-- Multi-peer sharing support
-- Kademlia DHT integration
-- Connection fallback (WebRTC → Relay)
-- Activity log UI
+- Multi-peer sharing support (all-to-all mesh topology)
+- Per-member permission management (owner can add/remove/modify individual peers)
+- Members list UI showing all peers with online status
+- Activity log displaying sync events
+- Kademlia DHT for discovering other peers in the same share
+
+**New Types:**
+```rust
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareMember {
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub permission: SharePermission,
+    pub joined_at: i64,
+    pub last_seen: i64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    pub share_id: String,
+    pub connection_type: ConnectionType,  // DirectTcp, Relay
+    pub latency_ms: Option<u64>,
+    pub bandwidth_bps: Option<u64>,
+}
+```
+
+**New Tauri Commands (Week 8):**
+```rust
+#[tauri::command]
+async fn p2p_add_member(
+    share_id: String,
+    invite_code: String,
+    state: State<'_, AppState>,
+) -> Result<ShareMember, String>
+
+#[tauri::command]
+async fn p2p_remove_member(
+    share_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String>
+
+#[tauri::command]
+async fn p2p_update_member_permission(
+    share_id: String,
+    peer_id: String,
+    permission: SharePermission,
+    state: State<'_, AppState>,
+) -> Result<(), String>
+
+#[tauri::command]
+async fn p2p_get_activity_log(share_id: String, state: State<'_, AppState>) -> Result<Vec<ActivityEntry>, String>
+```
 
 #### Week 9: Polish & Testing
 
 **Tasks:**
-1. Performance optimization
-2. Comprehensive testing
-3. Error handling improvements
-4. Documentation
-5. Edge case handling
+1. Performance optimization (concurrent transfers, adaptive chunking, compression)
+2. Connection fallback strategy (direct TCP → relay)
+3. Comprehensive error handling and recovery
+4. Network interruption recovery testing
+5. User documentation and troubleshooting guide
 
 **Deliverables:**
-- Performance optimizations (chunking, compression)
+- Concurrent file transfers (up to 3 files per connection)
+- Adaptive chunking (32KB for slow, 128KB for fast connections)
+- Zstd compression for files > 1MB
+- Connection pooling (reuse connections for 60s)
 - Comprehensive test coverage
 - User documentation
-- Edge case handling
 
 **Optimization Targets:**
-- Chunked file transfer (64KB chunks)
-- Concurrent transfers (up to 3 files)
-- Debouncing (2 second delay after changes)
-- Binary diff for large files
+- Chunked file transfer: 32-128 KB (adaptive based on bandwidth)
+- Concurrent transfers: Up to 3 files per connection
+- Compression: Zstd for files > 1MB
+- Connection pooling: Keep idle connections alive for 60 seconds
+- Sync debounce: 2 second delay after changes
 
 ---
 
@@ -362,6 +421,7 @@ pub struct SharedFolder {
     pub sync_status: SyncStatus,
     pub last_synced: i64,
     pub created_at: i64,
+    pub members: Vec<ShareMember>,  // Phase 3: Track all members
 }
 
 /// Invite code payload (encrypted before encoding)
@@ -402,6 +462,51 @@ pub struct CreateShareResult {
     pub share_id: String,
 }
 
+/// Share member information (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareMember {
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub permission: SharePermission,
+    pub joined_at: i64,
+    pub last_seen: i64,
+}
+
+/// Connection information (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    pub share_id: String,
+    pub connection_type: ConnectionType,
+    pub latency_ms: Option<u64>,
+    pub bandwidth_bps: Option<u64>,
+}
+
+/// Connection type (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ConnectionType {
+    DirectTcp,
+    Relay,
+}
+
+/// Activity log entry (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    pub timestamp: i64,
+    pub event_type: ActivityEventType,
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub details: String,
+}
+
+/// Activity event type (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum ActivityEventType {
+    PeerJoined,
+    PeerLeft,
+    FileSynced,
+    ConflictResolved,
+}
+
 /// Conflict resolution options
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -415,12 +520,34 @@ pub enum ConflictResolution {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data")]
 pub enum SyncMessage {
-    RequestManifest,
-    Manifest(Vec<FileManifest>),
-    RequestFile { path: String },
-    FileChunk { path: String, offset: u64, data: Vec<u8>, is_final: bool },
-    FileChanged { path: String },
+    /// Request manifest from peer for a specific share
+    RequestManifest { share_id: String },
+    /// Respond with manifest for a specific share
+    Manifest {
+        share_id: String,
+        files: Vec<FileManifest>,
+    },
+    /// Request file content from a specific share
+    RequestFile { share_id: String, path: String },
+    /// Respond with file content (chunked)
+    FileChunk {
+        share_id: String,
+        path: String,
+        offset: u64,
+        data: Vec<u8>,
+        is_final: bool,
+    },
+    /// Notification of file change in a share
+    FileChanged {
+        share_id: String,
+        path: String,
+        is_deleted: bool,
+    },
+    /// Share was revoked by owner
+    ShareRevoked { share_id: String },
+    /// Sync complete
     SyncComplete { has_conflicts: bool },
+    /// Error
     Error { message: String },
 }
 ```
@@ -451,8 +578,36 @@ export interface SharedFolder {
   sync_status: SyncStatus;
   last_synced: number;
   created_at: number;
+  members?: ShareMember[];  // Phase 3: Track all members
   file_count?: number;
   total_size?: number;
+}
+
+export interface ShareMember {  // Phase 3
+  peer_id: string;
+  peer_name: string | null;
+  permission: SharePermission;
+  joined_at: number;
+  last_seen: number;
+}
+
+export type ConnectionType = 'direct_tcp' | 'relay';  // Phase 3
+
+export interface ConnectionInfo {  // Phase 3
+  share_id: string;
+  connection_type: ConnectionType;
+  latency_ms: number | null;
+  bandwidth_bps: number | null;
+}
+
+export type ActivityEventType = 'peer_joined' | 'peer_left' | 'file_synced' | 'conflict_resolved';  // Phase 3
+
+export interface ActivityEntry {  // Phase 3
+  timestamp: number;
+  event_type: ActivityEventType;
+  peer_id: string;
+  peer_name: string | null;
+  details: string;
 }
 
 export interface P2PStatus {
@@ -538,6 +693,44 @@ async fn p2p_resolve_conflict(
 ```rust
 /// Discover available peers
 async fn p2p_discover_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>, String>
+
+/// Get connection info for a share (Phase 3)
+async fn p2p_get_connection_info(
+    share_id: String,
+    state: State<'_, AppState>,
+) -> Result<ConnectionInfo, String>
+```
+
+### Multi-peer Management (Phase 3)
+
+```rust
+/// Add a member to an existing share
+async fn p2p_add_member(
+    share_id: String,
+    invite_code: String,
+    state: State<'_, AppState>,
+) -> Result<ShareMember, String>
+
+/// Remove a member from a share
+async fn p2p_remove_member(
+    share_id: String,
+    peer_id: String,
+    state: State<'_, AppState>,
+) -> Result<(), String>
+
+/// Update a member's permission
+async fn p2p_update_member_permission(
+    share_id: String,
+    peer_id: String,
+    permission: SharePermission,
+    state: State<'_, AppState>,
+) -> Result<(), String>
+
+/// Get activity log for a share
+async fn p2p_get_activity_log(
+    share_id: String,
+    state: State<'_, AppState>,
+) -> Result<Vec<ActivityEntry>, String>
 ```
 
 ---
@@ -553,6 +746,9 @@ async fn p2p_discover_peers(state: State<'_, AppState>) -> Result<Vec<PeerInfo>,
 | `p2p-peer-disconnected` | `{ peer_id: string }` | Peer disconnected |
 | `p2p-conflict-detected` | `{ share_id: string, file_path: string, local_hash: string, remote_hash: string }` | Conflict detected |
 | `p2p-error` | `{ share_id: string, error: string }` | Error occurred |
+| `p2p-member-joined` | `{ share_id: string, peer_id: string, peer_name: string }` | Member joined share (Phase 3) |
+| `p2p-member-left` | `{ share_id: string, peer_id: string }` | Member left share (Phase 3) |
+| `p2p-connection-changed` | `{ share_id: string, connection_type: string, latency_ms: number }` | Connection type changed (Phase 3) |
 
 ---
 
@@ -568,7 +764,8 @@ src-tauri/src/p2p/
 ├── protocol.rs      # Sync protocol
 ├── sync.rs          # File sync engine
 ├── invite.rs        # Invite code generation
-└── discovery.rs     # Peer discovery
+├── discovery.rs     # Peer discovery
+└── activity.rs      # Activity log tracking (Phase 3)
 ```
 
 ### New TypeScript Files
@@ -587,7 +784,9 @@ src/
     ├── AcceptShareModal.tsx         # Accept share modal
     ├── SharedFoldersSection.tsx     # Settings page
     ├── SyncStatusIndicator.tsx      # Status indicator
-    └── ConflictResolutionDialog.tsx # Conflict resolution
+    ├── ConflictResolutionDialog.tsx # Conflict resolution
+    ├── ShareMembersList.tsx         # Members list (Phase 3)
+    └── ActivityLog.tsx              # Activity log (Phase 3)
 ```
 
 ### Modified Files
@@ -657,6 +856,31 @@ src/
     }
   ],
   "last_sync": 1234567890
+}
+```
+
+### Activity Log
+
+**Location:** `{NOTES_FOLDER}/.scratch/sync/{share_id}/activity.json` (Phase 3)
+
+```json
+{
+  "entries": [
+    {
+      "timestamp": 1234567890,
+      "event_type": "peer_joined",
+      "peer_id": "12D3KooW...",
+      "peer_name": "Alice",
+      "details": "Joined share"
+    },
+    {
+      "timestamp": 1234567895,
+      "event_type": "file_synced",
+      "peer_id": "12D3KooW...",
+      "peer_name": "Alice",
+      "details": "Synced 3 files"
+    }
+  ]
 }
 ```
 
@@ -739,15 +963,26 @@ src/
 #### Phase 3 Testing
 
 8. **WAN Connection**
-   - [ ] Test on different networks
-   - [ ] Verify WebRTC connection establishes
-   - [ ] Verify relay fallback works
-   - [ ] Test sync over WAN
+   - [ ] Test on different networks (home, office, mobile)
+   - [ ] Verify Kademlia DHT peer discovery works
+   - [ ] Verify AutoNAT establishes direct connections when possible
+   - [ ] Verify relay fallback works when NAT traversal fails
+   - [ ] Test sync over WAN with different connection types
 
-9. **Multi-peer Sharing**
-   - [ ] Share folder with multiple people
-   - [ ] Verify all peers receive updates
-   - [ ] Test concurrent edits from multiple peers
+9. **Multi-peer Mesh Sharing**
+   - [ ] Share folder with 3+ people
+   - [ ] Verify all peers can discover each other via DHT
+   - [ ] Verify all peers receive updates from any peer
+   - [ ] Test concurrent edits from multiple peers simultaneously
+   - [ ] Verify per-member permission changes work
+   - [ ] Test removing individual members from share
+
+10. **Performance Tests**
+   - [ ] Large file sync (>10MB) with adaptive chunking
+   - [ ] Many files sync (100+ files) with concurrent transfers
+   - [ ] Verify compression works for files > 1MB
+   - [ ] Test connection pooling and reuse
+   - [ ] Verify bandwidth-based chunk size adaptation
 
 ### Edge Cases
 
@@ -767,12 +1002,15 @@ src/
 
 | Metric | Target |
 |--------|--------|
-| File chunk size | 64 KB |
-| Concurrent transfers | Up to 3 files |
+| File chunk size | 32-128 KB (adaptive based on bandwidth) |
+| Concurrent transfers | Up to 3 files per connection |
 | Sync debounce delay | 2 seconds |
+| Connection pool timeout | 60 seconds |
+| Compression threshold | 1 MB (zstd) |
 | Max file size | 100 MB |
 | Max folder size | 5 GB |
 | Max concurrent shares | 10 |
+| Max peers per share | 20 |
 | Transfer speed limit | 10 MB/s |
 
 ---
@@ -915,11 +1153,13 @@ libp2p = { version = "0.54", features = [
     "mdns", "gossipsub", "identify", "ping",
     "request-response", "yamux", "noise",
     "tcp", "relay", "autonat",
-    "webrtc", "kad",  # Phase 3
+    "kad",      # Phase 3: Kademlia DHT for WAN peer discovery
+    "dcvr",     # Phase 3: DHT content routing
     "serde",
 ] }
 sha2 = "0.10"
 rand = "0.8"
+zstd = "0.13"  # Phase 3: Compression for large files
 ```
 
 ### package.json
@@ -967,16 +1207,22 @@ rand = "0.8"
 - [ ] Create ConflictResolutionDialog
 - [ ] Test all features
 
-### Phase 3: WAN + Polish
-- [ ] Add WebRTC transport
-- [ ] Implement relay client
-- [ ] Add Auto NAT
-- [ ] Implement Kademlia DHT
-- [ ] Implement multi-peer sharing
-- [ ] Create activity log
-- [ ] Performance optimization
-- [ ] Comprehensive testing
-- [ ] Documentation
+### Phase 3: WAN + Multi-peer + Polish
+- [ ] Add Kademlia DHT for WAN peer discovery
+- [ ] Configure AutoNAT with public relay servers
+- [ ] Implement TCP relay client fallback
+- [ ] Update ShareRuntime for multi-peer support
+- [ ] Implement all-to-all mesh sync topology
+- [ ] Add GossipSub for broadcasting changes
+- [ ] Implement per-member permission management
+- [ ] Create ShareMembersList component
+- [ ] Create ActivityLog component
+- [ ] Implement concurrent file transfers (3 per connection)
+- [ ] Add adaptive chunking (32-128 KB based on bandwidth)
+- [ ] Add Zstd compression for files > 1MB
+- [ ] Implement connection pooling (60s keep-alive)
+- [ ] Comprehensive testing (WAN, multi-peer, interruptions)
+- [ ] User documentation and troubleshooting guide
 
 ---
 

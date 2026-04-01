@@ -16,6 +16,7 @@ import type {
   SharePermission,
   CreateShareResult,
   SyncStatus,
+  ActivityEntry,
 } from "../types/share";
 
 function normalizeSyncStatus(status: unknown): SyncStatus {
@@ -64,6 +65,7 @@ interface ShareContextValue {
   isAccepting: boolean;
   syncProgress: Record<string, { progress: number; file?: string }>;
   conflicts: Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>;
+  activities: Record<string, ActivityEntry[]>;
   error: string | null;
 
   // Actions
@@ -81,6 +83,13 @@ interface ShareContextValue {
   refreshShares: () => Promise<void>;
   refreshP2PStatus: () => Promise<void>;
   clearError: () => void;
+
+  // Phase 3: Multi-peer actions
+  discoverPeers: () => Promise<void>;
+  addMember: (shareId: string, inviteCode: string) => Promise<void>;
+  removeMember: (shareId: string, peerId: string) => Promise<void>;
+  updateMemberPermission: (shareId: string, peerId: string, permission: "read_only" | "read_write") => Promise<void>;
+  getActivityLog: (shareId: string, limit?: number) => Promise<void>;
 }
 
 const ShareContext = createContext<ShareContextValue | null>(null);
@@ -93,6 +102,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
   const [isAccepting, setIsAccepting] = useState(false);
   const [syncProgress, setSyncProgress] = useState<Record<string, { progress: number; file?: string }>>({});
   const [conflicts, setConflicts] = useState<Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>>({});
+  const [activities, setActivities] = useState<Record<string, ActivityEntry[]>>({});
   const [error, setError] = useState<string | null>(null);
 
   // Use refs to avoid stale closure issues
@@ -285,6 +295,76 @@ export function ShareProvider({ children }: { children: ReactNode }) {
     [refreshShares]
   );
 
+  // ============ Phase 3: Multi-peer Functions ============
+
+  // Discover peers
+  const discoverPeers = useCallback(async () => {
+    setError(null);
+    try {
+      await ensureP2PRunning();
+      const peers = await shareService.discoverPeers();
+      console.log("Discovered peers:", peers);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to discover peers";
+      setError(message);
+    }
+  }, [ensureP2PRunning]);
+
+  // Add member to share
+  const addMember = useCallback(async (shareId: string, inviteCode: string) => {
+    setError(null);
+    try {
+      await shareService.addMember(shareId, inviteCode);
+      await refreshShares();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to add member";
+      setError(message);
+      throw err;
+    }
+  }, [refreshShares]);
+
+  // Remove member from share
+  const removeMember = useCallback(async (shareId: string, peerId: string) => {
+    setError(null);
+    try {
+      await shareService.removeMember(shareId, peerId);
+      await refreshShares();
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Failed to remove member";
+      setError(message);
+      throw err;
+    }
+  }, [refreshShares]);
+
+  // Update member permission
+  const updateMemberPermission = useCallback(
+    async (shareId: string, peerId: string, permission: "read_only" | "read_write") => {
+      setError(null);
+      try {
+        await shareService.updateMemberPermission(shareId, peerId, permission);
+        await refreshShares();
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to update member permission";
+        setError(message);
+        throw err;
+      }
+    },
+    [refreshShares]
+  );
+
+  // Get activity log
+  const getActivityLog = useCallback(async (shareId: string, limit?: number) => {
+    try {
+      const log = await shareService.getActivityLog(shareId, limit);
+      setActivities((prev) => ({
+        ...prev,
+        [shareId]: log,
+      }));
+    } catch (err) {
+      console.error("Failed to get activity log:", err);
+    }
+  }, []);
+
   // Initialize P2P on mount
   useEffect(() => {
     const initP2P = async () => {
@@ -370,7 +450,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       const data = event as {
         payload: { share_id: string; file_path: string; local_hash: string; remote_hash: string };
       };
-      setConflicts((prev) => {
+      setConflicts((prev: Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>) => {
         const existing = prev[data.payload.share_id] || [];
         if (existing.some((entry) => entry.file_path === data.payload.file_path)) {
           return prev;
@@ -397,7 +477,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       const data = event as { payload: { share_id: string } };
       const share = sharesRef.current.find((item) => item.id === data.payload.share_id);
       const shouldDeleteLocalData = share ? !share.is_owner : true;
-      setConflicts((prev) => {
+      setConflicts((prev: Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>) => {
         const next = { ...prev };
         delete next[data.payload.share_id];
         return next;
@@ -419,6 +499,44 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       refreshP2PStatus();
     }).then((unlisten) => unlisteners.push(unlisten));
 
+    // Phase 3: Listen for member events
+    listen("p2p-member-joined", (event: unknown) => {
+      const data = event as { payload: { share_id: string; peer_id: string; peer_name: string | null } };
+      console.log("Member joined:", data.payload);
+      refreshShares();
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-member-left", (event: unknown) => {
+      const data = event as { payload: { share_id: string; peer_id: string } };
+      console.log("Member left:", data.payload);
+      refreshShares();
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-connection-changed", (event: unknown) => {
+      const data = event as { payload: { share_id: string; connection_type: string; latency_ms?: number } };
+      console.log("Connection changed:", data.payload);
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    // Phase 3: Listen for activity events
+    listen("p2p-activity-log", (event: unknown) => {
+      const data = event as { payload: { share_id: string; activity: ActivityEntry[] } };
+      setActivities((prev: Record<string, ActivityEntry[]>) => ({
+        ...prev,
+        [data.payload.share_id]: data.payload.activity,
+      }));
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-activity-entry", (event: unknown) => {
+      const data = event as { payload: { share_id: string; entry: ActivityEntry } };
+      setActivities((prev: Record<string, ActivityEntry[]>) => {
+        const existing = prev[data.payload.share_id] || [];
+        return {
+          ...prev,
+          [data.payload.share_id]: [data.payload.entry, ...existing].slice(0, 100), // Keep last 100 entries
+        };
+      });
+    }).then((unlisten) => unlisteners.push(unlisten));
+
     // Cleanup
     return () => {
       unlisteners.forEach((unlisten) => unlisten());
@@ -435,6 +553,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isAccepting,
       syncProgress,
       conflicts,
+      activities,
       error,
       startP2P,
       stopP2P,
@@ -446,6 +565,11 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       refreshShares,
       refreshP2PStatus,
       clearError,
+      discoverPeers,
+      addMember,
+      removeMember,
+      updateMemberPermission,
+      getActivityLog,
     }),
     [
       shares,
@@ -456,6 +580,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isAccepting,
       syncProgress,
       conflicts,
+      activities,
       error,
       startP2P,
       stopP2P,
@@ -467,6 +592,11 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       refreshShares,
       refreshP2PStatus,
       clearError,
+      discoverPeers,
+      addMember,
+      removeMember,
+      updateMemberPermission,
+      getActivityLog,
     ]
   );
 

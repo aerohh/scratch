@@ -22,8 +22,36 @@ export interface SharedFolder {
   sync_status: SyncStatus;
   last_synced: number;
   created_at: number;
+  members?: ShareMember[];
   file_count?: number;
   total_size?: number;
+}
+
+export interface ShareMember {
+  peer_id: string;
+  peer_name: string | null;
+  permission: SharePermission;
+  joined_at: number;
+  last_seen: number;
+}
+
+export type ConnectionType = 'direct_tcp' | 'relay';
+
+export interface ConnectionInfo {
+  share_id: string;
+  connection_type: ConnectionType;
+  latency_ms: number | null;
+  bandwidth_bps: number | null;
+}
+
+export type ActivityEventType = 'peer_joined' | 'peer_left' | 'file_synced' | 'conflict_resolved';
+
+export interface ActivityEntry {
+  timestamp: number;
+  event_type: ActivityEventType;
+  peer_id: string;
+  peer_name: string | null;
+  details: string;
 }
 
 export interface P2PStatus {

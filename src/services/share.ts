@@ -8,6 +8,10 @@ import type {
   AcceptShareOptions,
   CreateShareResult,
   SyncStatus,
+  PeerInfo,
+  ConnectionInfo,
+  ShareMember,
+  ActivityEntry,
 } from "../types/share";
 
 /**
@@ -164,4 +168,62 @@ export function parseInviteCode(inviteCode: string): {
   } catch {
     return null;
   }
+}
+
+// ============ Phase 3: Multi-peer & WAN Commands ============
+
+/**
+ * Discover available peers via Kademlia DHT
+ */
+export async function discoverPeers(): Promise<PeerInfo[]> {
+  return invoke("p2p_discover_peers");
+}
+
+/**
+ * Get connection information for a specific share
+ */
+export async function getConnectionInfo(shareId: string): Promise<ConnectionInfo> {
+  return invoke("p2p_get_connection_info", { shareId });
+}
+
+/**
+ * Add a member to an existing share (multi-peer sharing)
+ */
+export async function addMember(
+  shareId: string,
+  inviteCode: string
+): Promise<ShareMember> {
+  return invoke("p2p_add_member", { shareId, inviteCode });
+}
+
+/**
+ * Remove a member from a share
+ */
+export async function removeMember(shareId: string, peerId: string): Promise<void> {
+  return invoke("p2p_remove_member", { shareId, peerId });
+}
+
+/**
+ * Update a member's permission
+ */
+export async function updateMemberPermission(
+  shareId: string,
+  peerId: string,
+  permission: "read_only" | "read_write"
+): Promise<void> {
+  return invoke("p2p_update_member_permission", {
+    shareId,
+    peerId,
+    permission,
+  });
+}
+
+/**
+ * Get activity log for a share
+ */
+export async function getActivityLog(
+  shareId: string,
+  limit?: number
+): Promise<ActivityEntry[]> {
+  return invoke("p2p_get_activity_log", { shareId, limit });
 }

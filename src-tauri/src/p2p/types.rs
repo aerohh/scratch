@@ -68,6 +68,55 @@ pub struct SharedFolder {
     pub sync_status: SyncStatus,
     pub last_synced: i64,
     pub created_at: i64,
+    #[serde(default)]
+    pub members: Vec<ShareMember>,
+}
+
+/// Share member information (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShareMember {
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub permission: SharePermission,
+    pub joined_at: i64,
+    pub last_seen: i64,
+}
+
+/// Connection type (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ConnectionType {
+    DirectTcp,
+    Relay,
+}
+
+/// Connection information (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectionInfo {
+    pub share_id: String,
+    pub connection_type: ConnectionType,
+    pub latency_ms: Option<u64>,
+    pub bandwidth_bps: Option<u64>,
+}
+
+/// Activity event type (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ActivityEventType {
+    PeerJoined,
+    PeerLeft,
+    FileSynced,
+    ConflictResolved,
+}
+
+/// Activity log entry (Phase 3)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ActivityEntry {
+    pub timestamp: i64,
+    pub event_type: ActivityEventType,
+    pub peer_id: String,
+    pub peer_name: Option<String>,
+    pub details: String,
 }
 
 /// Invite code payload (encrypted before encoding)
@@ -225,3 +274,12 @@ pub const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024;
 
 /// Default sync debounce delay (2 seconds)
 pub const SYNC_DEBOUNCE_MS: u64 = 2000;
+
+/// Max concurrent transfers (Phase 3)
+pub const MAX_CONCURRENT_TRANSFERS: usize = 3;
+
+/// Connection pool timeout in seconds (Phase 3)
+pub const CONNECTION_POOL_TIMEOUT_SECS: u64 = 60;
+
+/// Compression threshold in bytes (Phase 3)
+pub const COMPRESSION_THRESHOLD: u64 = 1024 * 1024; // 1 MB

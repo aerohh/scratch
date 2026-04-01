@@ -51,7 +51,9 @@ libp2p = { version = "0.54", features = [
     "autonat",           # Auto NAT traversal
     "ping",              # Keep-alive protocol
     "serde",             # Serialization
+    "kad",               # Kademlia DHT for WAN peer discovery
 ] }
 sha2 = "0.10"
 rand = "0.8"
 hex = "0.4"
+zstd = "0.13"

@@ -1,6 +1,6 @@
 // File sync engine
 
-use crate::p2p::types::{FileManifest, CHUNK_SIZE, MAX_FILE_SIZE};
+use crate::p2p::types::{FileManifest, CHUNK_SIZE, MAX_FILE_SIZE, COMPRESSION_THRESHOLD};
 use anyhow::{Context, Result};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -83,6 +83,11 @@ impl SyncEngine {
         }
 
         Ok(manifests)
+    }
+
+    /// Public method to calculate hash of a file
+    pub async fn hash_file(&self, path: &Path) -> String {
+        self.calculate_file_hash(path).await.unwrap_or_default()
     }
 
     /// Calculate SHA-256 hash of a file
@@ -223,6 +228,42 @@ impl SyncEngine {
             .map_err(|_| anyhow::anyhow!("Invalid path: outside shared folder"))?
             .then_some(())
             .ok_or_else(|| anyhow::anyhow!("Path traversal detected"))
+    }
+
+    /// Compress data using zstd if it's large enough
+    pub fn compress_data(data: &[u8]) -> Result<Vec<u8>> {
+        if data.len() < COMPRESSION_THRESHOLD as usize {
+            // Don't compress small files
+            return Ok(data.to_vec());
+        }
+
+        let compressed = zstd::encode_all(data.as_ref(), 3)
+            .map_err(|e| anyhow::anyhow!("Compression failed: {}", e))?;
+
+        // Only use compressed data if it's actually smaller
+        Ok(if compressed.len() < data.len() {
+            compressed
+        } else {
+            data.to_vec()
+        })
+    }
+
+    /// Decompress data (attempts zstd decompression)
+    pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>> {
+        // Try to decompress as zstd
+        match zstd::decode_all(data.as_ref()) {
+            Ok(decompressed) => Ok(decompressed),
+            Err(_) => {
+                // If decompression fails, assume data wasn't compressed
+                Ok(data.to_vec())
+            }
+        }
+    }
+
+    /// Check if data appears to be zstd compressed
+    pub fn is_compressed(data: &[u8]) -> bool {
+        // Zstd magic number check (simplified)
+        data.len() > 3 && data[0] == 0xFD && data[1] == 0x2F && data[2] == 0xB5
     }
 }
 

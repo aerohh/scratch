@@ -6,14 +6,18 @@ pub mod discovery;
 pub mod network;
 pub mod sync;
 pub mod types;
+pub mod activity;
 
 // Re-export commonly used types
 pub use types::{
-    CreateShareResult, P2PState, P2PStatus, SharePermission, SharedFolder, SyncStatus,
+    ActivityEntry, ConnectionInfo, ConnectionType, CreateShareResult,
+    P2PState, P2PStatus, PeerInfo, ShareMember, SharePermission, SharedFolder, SyncStatus,
 };
 
 pub use invite::{
-    create_invite_payload, decode_invite_code, encode_invite_code, generate_share_id,
+    create_invite_payload, decode_invite_code, encode_invite_code,
 };
 
 pub use network::NetworkManager;
+
+pub use activity::ActivityTracker;
