@@ -104,13 +104,13 @@ mod tests {
         let mut manager = DiscoveryManager::new(peer_id);
 
         let test_peer = PeerId::random();
-        let addr = "/ip4/127.0.0.1/tcp/8000".parse().unwrap();
+        let addr: libp2p::Multiaddr = "/ip4/127.0.0.1/tcp/8000".parse().unwrap();
 
         manager.add_discovered_peer(test_peer, vec![addr.clone()]);
 
         assert!(manager.knows_peer(&test_peer));
         assert_eq!(manager.peer_count(), 1);
-        assert_eq!(manager.get_peer_addresses(&test_peer), Some(vec![addr.as_ref()].as_slice()));
+        assert_eq!(manager.get_peer_addresses(&test_peer), Some(vec![addr].as_slice()));
 
         manager.remove_expired_peer(&test_peer);
 

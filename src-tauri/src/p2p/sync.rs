@@ -340,8 +340,8 @@ mod tests {
 
         assert_eq!(diff.unchanged, vec!["file1.md"]);
         assert_eq!(diff.to_download.len(), 2);
-        assert!(diff.to_download.iter().any(|(p, _)| p == "file2.md"));
-        assert!(diff.to_download.iter().any(|(p, _)| p == "file3.md"));
+        assert!(diff.to_download.iter().any(|p| p == "file2.md"));
+        assert!(diff.to_download.iter().any(|p| p == "file3.md"));
         assert!(diff.to_upload.is_empty());
         assert!(diff.conflicts.is_empty());
     }

@@ -3556,7 +3556,7 @@ async fn p2p_start(app: AppHandle, state: State<'_, AppState>) -> Result<p2p::P2
                 return Ok(p2p::P2PStatus {
                     is_running: true,
                     peer_id: peer_id.to_string(),
-                    connected_peers: 0,
+                    connected_peers: net.connected_peers(),
                 });
             }
         }
@@ -3578,7 +3578,7 @@ async fn p2p_start(app: AppHandle, state: State<'_, AppState>) -> Result<p2p::P2
     Ok(p2p::P2PStatus {
         is_running: true,
         peer_id: peer_id.to_string(),
-        connected_peers: 0,
+        connected_peers: net_manager.connected_peers(),
     })
 }
 
@@ -3627,113 +3627,63 @@ async fn p2p_get_status(state: State<'_, AppState>) -> Result<p2p::P2PStatus, St
     })
 }
 
-fn bootstrap_copy_shared_folder(source: &Path, destination: &Path) -> Result<usize, String> {
-    if !source.exists() {
-        return Err(format!(
-            "Shared source folder no longer exists: {}",
-            source.display()
-        ));
-    }
-
-    let source_canonical = source
+fn resolve_share_folder_path(base_path: &Path, input: &str) -> Result<PathBuf, String> {
+    let base_canonical = base_path
         .canonicalize()
-        .map_err(|e| format!("Failed to resolve source path: {}", e))?;
-    let destination_canonical = destination.canonicalize().unwrap_or_else(|_| destination.to_path_buf());
+        .map_err(|e| format!("Failed to resolve notes folder: {}", e))?;
 
-    if source_canonical == destination_canonical {
-        return Ok(0);
+    if input.trim().is_empty() {
+        return Ok(base_canonical);
     }
 
-    let mut copied_files = 0usize;
+    if input.contains('\\') {
+        return Err("Invalid folder path: backslashes are not allowed".to_string());
+    }
 
-    for entry in walkdir::WalkDir::new(&source_canonical) {
-        let entry = entry.map_err(|e| format!("Failed reading source folder: {}", e))?;
-        let entry_path = entry.path();
-        let relative = entry_path
-            .strip_prefix(&source_canonical)
-            .map_err(|e| format!("Invalid source path: {}", e))?;
+    let rel = Path::new(input);
+    if rel.is_absolute() {
+        return Err("Invalid folder path: absolute paths are not allowed".to_string());
+    }
 
-        if relative.as_os_str().is_empty() {
-            continue;
-        }
+    let mut resolved = base_canonical.clone();
+    for component in rel.components() {
+        match component {
+            std::path::Component::Normal(name) => {
+                resolved.push(name);
 
-        if relative
-            .components()
-            .any(|c| c.as_os_str() == std::ffi::OsStr::new(".scratch"))
-        {
-            continue;
-        }
-
-        let target = destination.join(relative);
-
-        if entry.file_type().is_dir() {
-            std::fs::create_dir_all(&target)
-                .map_err(|e| format!("Failed to create destination directory: {}", e))?;
-            continue;
-        }
-
-        if entry.file_type().is_file() {
-            if let Some(parent) = target.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("Failed to create parent directory: {}", e))?;
+                // Block traversal via symlink components that escape the notes folder.
+                if resolved.exists() {
+                    let metadata = std::fs::symlink_metadata(&resolved)
+                        .map_err(|e| format!("Failed to read path metadata: {}", e))?;
+                    if metadata.file_type().is_symlink() {
+                        let target = resolved
+                            .canonicalize()
+                            .map_err(|e| format!("Failed to resolve symlink: {}", e))?;
+                        if !target.starts_with(&base_canonical) {
+                            return Err(
+                                "Invalid folder path: symlink escapes notes folder".to_string(),
+                            );
+                        }
+                    }
+                }
             }
-
-            std::fs::copy(entry_path, &target)
-                .map_err(|e| format!("Failed to copy '{}' : {}", entry_path.display(), e))?;
-            copied_files += 1;
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                return Err(
+                    "Invalid folder path: parent directory references are not allowed".to_string(),
+                );
+            }
+            std::path::Component::RootDir | std::path::Component::Prefix(_) => {
+                return Err("Invalid folder path: absolute paths are not allowed".to_string());
+            }
         }
     }
 
-    Ok(copied_files)
-}
-
-fn try_link_shared_folder(source: &Path, destination: &Path) -> Result<bool, String> {
-    if !source.exists() {
-        return Ok(false);
+    if !resolved.starts_with(&base_canonical) {
+        return Err("Invalid folder path: path escapes notes folder".to_string());
     }
 
-    let source_canonical = source
-        .canonicalize()
-        .map_err(|e| format!("Failed to resolve source path: {}", e))?;
-    let destination_parent = destination
-        .parent()
-        .ok_or("Invalid destination path".to_string())?;
-
-    std::fs::create_dir_all(destination_parent)
-        .map_err(|e| format!("Failed to create destination parent: {}", e))?;
-
-    // If destination exists and is an empty directory created by accept flow, remove it first.
-    if destination.exists() {
-        let is_empty_dir = destination.is_dir()
-            && std::fs::read_dir(destination)
-                .map_err(|e| format!("Failed to read destination directory: {}", e))?
-                .next()
-                .is_none();
-
-        if is_empty_dir {
-            std::fs::remove_dir(destination)
-                .map_err(|e| format!("Failed to prepare destination for linking: {}", e))?;
-        } else {
-            return Ok(false);
-        }
-    }
-
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(&source_canonical, destination)
-            .map_err(|e| format!("Failed to create symlink: {}", e))?;
-        return Ok(true);
-    }
-
-    #[cfg(windows)]
-    {
-        std::os::windows::fs::symlink_dir(&source_canonical, destination)
-            .map_err(|e| format!("Failed to create directory symlink: {}", e))?;
-        return Ok(true);
-    }
-
-    #[allow(unreachable_code)]
-    Ok(false)
+    Ok(resolved)
 }
 
 fn share_relative_file_path(share_local_path: &str, note_id: &str) -> Option<String> {
@@ -3751,9 +3701,9 @@ fn share_relative_file_path(share_local_path: &str, note_id: &str) -> Option<Str
 }
 
 fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted: bool) {
-    let shares = {
+    let (shares, local_peer_id) = {
         let p2p_state = state.p2p_state.lock().expect("p2p_state lock");
-        p2p_state.shares.clone()
+        (p2p_state.shares.clone(), p2p_state.peer_id.clone())
     };
 
     if shares.is_empty() {
@@ -3764,6 +3714,15 @@ fn notify_p2p_note_change(state: &State<'_, AppState>, note_id: &str, is_deleted
     let Some(net) = network.as_ref() else { return; };
 
     for share in shares {
+        let is_owner = local_peer_id
+            .as_deref()
+            .map(|id| id == share.peer_id)
+            .unwrap_or(false);
+        let can_send_changes = is_owner || matches!(share.permission, p2p::SharePermission::ReadWrite);
+        if !can_send_changes {
+            continue;
+        }
+
         if let Some(relative_path) = share_relative_file_path(&share.local_path, note_id) {
             net.notify_file_change(share.id.clone(), relative_path, is_deleted);
         }
@@ -3801,17 +3760,16 @@ async fn p2p_create_share(
             .ok_or("P2P not started. Call p2p_start first.")?
     };
 
-    // Resolve folder path
+    // Resolve and validate folder path
     let base_path = PathBuf::from(&notes_folder);
-    let full_path = if folder_path.is_empty() {
-        base_path.clone()
-    } else {
-        base_path.join(&folder_path)
-    };
+    let full_path = resolve_share_folder_path(&base_path, &folder_path)?;
 
     // Validate path exists
     if !full_path.exists() {
         return Err(format!("Folder not found: {}", folder_path));
+    }
+    if !full_path.is_dir() {
+        return Err(format!("Path is not a folder: {}", folder_path));
     }
 
     // Get folder name
@@ -3826,7 +3784,7 @@ async fn p2p_create_share(
         peer_id.clone(),
         folder_name.clone(),
         share_permission.clone(),
-        Some(full_path.to_string_lossy().into_owned()),
+        None,
     )
         .map_err(|e| format!("Failed to create invite: {}", e))?;
 
@@ -3844,7 +3802,7 @@ async fn p2p_create_share(
         remote_path: folder_name.clone(),
         peer_id: peer_id.clone(),
         peer_name: None,
-        permission: share_permission,
+        permission: share_permission.clone(),
         sync_status: p2p::SyncStatus::Idle,
         last_synced: 0,
         created_at: chrono::Utc::now().timestamp(),
@@ -3853,6 +3811,9 @@ async fn p2p_create_share(
     // Add to state
     {
         let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        if p2p_state.get_share(&share_id).is_some() {
+            return Err(format!("Share already exists: {}", share_id));
+        }
         p2p_state.add_share(shared_folder);
     }
 
@@ -3862,7 +3823,13 @@ async fn p2p_create_share(
         .expect("p2p_network lock")
         .as_ref()
     {
-        network.register_share(share_id.clone(), full_path.clone(), None);
+        network.register_share(
+            share_id.clone(),
+            full_path.clone(),
+            None,
+            share_permission,
+            true,
+        );
     }
 
     log::info!("Created share '{}' for folder '{}'", share_id, folder_path);
@@ -3902,57 +3869,19 @@ async fn p2p_accept_share(
             .ok_or("P2P not started. Call p2p_start first.")?
     };
 
-    // Validate destination path
+    // Resolve and validate destination path
     let base_path = PathBuf::from(&notes_folder);
-    let dest_path = if destination_path.is_empty() {
-        base_path.join(&payload.folder_name)
+    let destination_input = if destination_path.is_empty() {
+        payload.folder_name.clone()
     } else {
-        base_path.join(&destination_path)
+        destination_path
     };
+    let dest_path = resolve_share_folder_path(&base_path, &destination_input)?;
 
     // Ensure destination directory exists
     fs::create_dir_all(&dest_path)
         .await
         .map_err(|e| format!("Failed to create destination directory: {}", e))?;
-
-    if let Some(source_path) = payload.source_path.as_ref() {
-        let source = PathBuf::from(source_path);
-        if source.exists() {
-            match try_link_shared_folder(&source, &dest_path) {
-                Ok(true) => {
-                    log::info!(
-                        "Linked shared folder '{}' to '{}' for live local sync",
-                        source.display(),
-                        dest_path.display()
-                    );
-                }
-                Ok(false) => {
-                    let copied_files = bootstrap_copy_shared_folder(&source, &dest_path)?;
-                    log::info!(
-                        "Bootstrapped share '{}' with {} file(s) from '{}'",
-                        payload.folder_name,
-                        copied_files,
-                        source.display()
-                    );
-                }
-                Err(link_err) => {
-                    log::warn!(
-                        "Link mode failed for '{}' -> '{}': {}. Falling back to file copy.",
-                        source.display(),
-                        dest_path.display(),
-                        link_err
-                    );
-                    let copied_files = bootstrap_copy_shared_folder(&source, &dest_path)?;
-                    log::info!(
-                        "Bootstrapped share '{}' with {} file(s) from '{}' after link fallback",
-                        payload.folder_name,
-                        copied_files,
-                        source.display()
-                    );
-                }
-            }
-        }
-    }
 
     // Get relative path
     let relative_path = dest_path
@@ -3979,6 +3908,9 @@ async fn p2p_accept_share(
     // Add to state
     {
         let mut p2p_state = state.p2p_state.lock().expect("p2p_state lock");
+        if p2p_state.get_share(&share_id).is_some() {
+            return Err(format!("Share already exists: {}", share_id));
+        }
         p2p_state.add_share(shared_folder.clone());
     }
 
@@ -3992,6 +3924,8 @@ async fn p2p_accept_share(
             share_id.clone(),
             dest_path.clone(),
             Some(payload.sender_peer_id.clone()),
+            payload.permissions.clone(),
+            false,
         );
     }
 

@@ -1,6 +1,6 @@
 use crate::p2p::protocol::{SyncCodec, SYNC_PROTOCOL};
 use crate::p2p::sync::SyncEngine;
-use crate::p2p::types::{SyncMessage, SyncStatus};
+use crate::p2p::types::{SharePermission, SyncMessage, SyncStatus};
 use anyhow::Result;
 use libp2p::request_response::{self, ProtocolSupport};
 use libp2p::swarm::NetworkBehaviour;
@@ -41,6 +41,8 @@ impl From<request_response::Event<SyncMessage, SyncMessage>> for BehaviourEvent 
 struct ShareRuntime {
     local_path: PathBuf,
     remote_peer: Option<PeerId>,
+    permission: SharePermission,
+    is_owner: bool,
 }
 
 #[derive(Debug)]
@@ -49,6 +51,8 @@ enum NetworkCommand {
         share_id: String,
         local_path: PathBuf,
         remote_peer: Option<PeerId>,
+        permission: SharePermission,
+        is_owner: bool,
     },
     RemoveShare {
         share_id: String,
@@ -137,10 +141,18 @@ impl NetworkManager {
                     command = command_rx.recv() => {
                         let Some(command) = command else { break; };
                         match command {
-                            NetworkCommand::RegisterShare { share_id, local_path, remote_peer } => {
+                            NetworkCommand::RegisterShare {
+                                share_id,
+                                local_path,
+                                remote_peer,
+                                permission,
+                                is_owner,
+                            } => {
                                 shares.insert(share_id.clone(), ShareRuntime {
                                     local_path,
                                     remote_peer,
+                                    permission,
+                                    is_owner,
                                 });
 
                                 if let Some(peer) = remote_peer {
@@ -159,21 +171,45 @@ impl NetworkManager {
                                 pending_manifest.retain(|(_, id)| id != &share_id);
                             }
                             NetworkCommand::NotifyFileChange { share_id, relative_path, is_deleted } => {
-                                for peer in runtime_state
-                                    .lock()
-                                    .expect("runtime state lock")
-                                    .connected_peers
-                                    .iter()
-                                    .copied()
-                                {
-                                    swarm.behaviour_mut().request_response.send_request(
-                                        &peer,
-                                        SyncMessage::FileChanged {
-                                            share_id: share_id.clone(),
-                                            path: relative_path.clone(),
-                                            is_deleted,
-                                        },
-                                    );
+                                let Some(share) = shares.get(&share_id) else { continue; };
+                                let can_send_changes = share.is_owner || matches!(share.permission, SharePermission::ReadWrite);
+                                if !can_send_changes {
+                                    continue;
+                                }
+
+                                if let Some(peer) = share.remote_peer {
+                                    if runtime_state
+                                        .lock()
+                                        .expect("runtime state lock")
+                                        .connected_peers
+                                        .contains(&peer)
+                                    {
+                                        swarm.behaviour_mut().request_response.send_request(
+                                            &peer,
+                                            SyncMessage::FileChanged {
+                                                share_id: share_id.clone(),
+                                                path: relative_path.clone(),
+                                                is_deleted,
+                                            },
+                                        );
+                                    }
+                                } else {
+                                    for peer in runtime_state
+                                        .lock()
+                                        .expect("runtime state lock")
+                                        .connected_peers
+                                        .iter()
+                                        .copied()
+                                    {
+                                        swarm.behaviour_mut().request_response.send_request(
+                                            &peer,
+                                            SyncMessage::FileChanged {
+                                                share_id: share_id.clone(),
+                                                path: relative_path.clone(),
+                                                is_deleted,
+                                            },
+                                        );
+                                    }
                                 }
                             }
                             NetworkCommand::Shutdown => break,
@@ -290,7 +326,14 @@ impl NetworkManager {
         Ok(())
     }
 
-    pub fn register_share(&self, share_id: String, local_path: PathBuf, remote_peer_id: Option<String>) {
+    pub fn register_share(
+        &self,
+        share_id: String,
+        local_path: PathBuf,
+        remote_peer_id: Option<String>,
+        permission: SharePermission,
+        is_owner: bool,
+    ) {
         let Some(tx) = self.command_tx.as_ref() else { return; };
         let remote_peer = remote_peer_id
             .and_then(|id| id.parse::<PeerId>().ok());
@@ -298,6 +341,8 @@ impl NetworkManager {
             share_id,
             local_path,
             remote_peer,
+            permission,
+            is_owner,
         });
     }
 
@@ -448,6 +493,17 @@ async fn handle_inbound_request(
             is_deleted,
         } => {
             if let Some(share) = shares.get(&share_id) {
+                let allow_remote_write = !share.is_owner || matches!(share.permission, SharePermission::ReadWrite);
+                if !allow_remote_write {
+                    let _ = behaviour.send_response(
+                        channel,
+                        SyncMessage::Error {
+                            message: "Share is read-only for remote updates".to_string(),
+                        },
+                    );
+                    return;
+                }
+
                 if let Some(full_path) = resolve_share_file(&share.local_path, &path) {
                     if is_deleted {
                         let _ = tokio::fs::remove_file(&full_path).await;
@@ -495,14 +551,34 @@ async fn handle_inbound_response(
                 let engine = SyncEngine::new(share.local_path.clone());
                 if let Ok(local_manifest) = engine.generate_manifest().await {
                     let diff = engine.compare_manifests(&local_manifest, &files);
-                    for path in diff.to_download {
-                        behaviour.send_request(
-                            &peer,
-                            SyncMessage::RequestFile {
-                                share_id: share_id.clone(),
-                                path,
-                            },
-                        );
+                    if !share.is_owner && matches!(share.permission, SharePermission::ReadOnly) {
+                        let remote_map: HashMap<_, _> = files.iter().map(|m| (&m.path, m)).collect();
+                        for local_file in &local_manifest {
+                            if let Some(remote_file) = remote_map.get(&local_file.path) {
+                                if local_file.hash != remote_file.hash {
+                                    behaviour.send_request(
+                                        &peer,
+                                        SyncMessage::RequestFile {
+                                            share_id: share_id.clone(),
+                                            path: local_file.path.clone(),
+                                        },
+                                    );
+                                }
+                            } else if let Some(full_path) = resolve_share_file(&share.local_path, &local_file.path) {
+                                let _ = tokio::fs::remove_file(&full_path).await;
+                                emit_note_change(app, notes_root, &full_path, "deleted").await;
+                            }
+                        }
+                    } else {
+                        for path in diff.to_download {
+                            behaviour.send_request(
+                                &peer,
+                                SyncMessage::RequestFile {
+                                    share_id: share_id.clone(),
+                                    path,
+                                },
+                            );
+                        }
                     }
                 }
             }
