@@ -41,6 +41,7 @@ impl From<request_response::Event<SyncMessage, SyncMessage>> for BehaviourEvent 
 struct ShareRuntime {
     local_path: PathBuf,
     remote_peer: Option<PeerId>,
+    known_peers: HashSet<PeerId>,
     permission: SharePermission,
     is_owner: bool,
 }
@@ -55,6 +56,9 @@ enum NetworkCommand {
         is_owner: bool,
     },
     RemoveShare {
+        share_id: String,
+    },
+    RevokeShare {
         share_id: String,
     },
     NotifyFileChange {
@@ -115,12 +119,16 @@ impl NetworkManager {
         }
     }
 
-    pub fn start(&mut self, app: AppHandle, notes_root: PathBuf) -> Result<String> {
+    pub fn start(
+        &mut self,
+        app: AppHandle,
+        notes_root: PathBuf,
+        keypair: libp2p::identity::Keypair,
+    ) -> Result<String> {
         if self.is_running {
             anyhow::bail!("P2P network is already running");
         }
 
-        let keypair = libp2p::identity::Keypair::generate_ed25519();
         let local_peer_id = keypair.public().to_peer_id();
         let peer_id_str = local_peer_id.to_string();
 
@@ -177,9 +185,14 @@ impl NetworkManager {
                                 permission,
                                 is_owner,
                             } => {
+                                let mut known_peers = HashSet::new();
+                                if let Some(peer) = remote_peer {
+                                    known_peers.insert(peer);
+                                }
                                 shares.insert(share_id.clone(), ShareRuntime {
                                     local_path,
                                     remote_peer,
+                                    known_peers,
                                     permission,
                                     is_owner,
                                 });
@@ -195,6 +208,34 @@ impl NetworkManager {
                                 }
                             }
                             NetworkCommand::RemoveShare { share_id } => {
+                                shares.remove(&share_id);
+                                pending_manifest.retain(|(_, id)| id != &share_id);
+                            }
+                            NetworkCommand::RevokeShare { share_id } => {
+                                if let Some(share) = shares.get(&share_id) {
+                                    let mut targets: Vec<PeerId> = Vec::new();
+                                    if let Some(peer) = share.remote_peer {
+                                        targets.push(peer);
+                                    } else {
+                                        targets.extend(share.known_peers.iter().copied());
+                                    }
+
+                                    for peer in targets {
+                                        if runtime_state
+                                            .lock()
+                                            .expect("runtime state lock")
+                                            .connected_peers
+                                            .contains(&peer)
+                                        {
+                                            swarm.behaviour_mut().request_response.send_request(
+                                                &peer,
+                                                SyncMessage::ShareRevoked {
+                                                    share_id: share_id.clone(),
+                                                },
+                                            );
+                                        }
+                                    }
+                                }
                                 shares.remove(&share_id);
                                 pending_manifest.retain(|(_, id)| id != &share_id);
                             }
@@ -222,13 +263,15 @@ impl NetworkManager {
                                         );
                                     }
                                 } else {
-                                    for peer in runtime_state
-                                        .lock()
-                                        .expect("runtime state lock")
-                                        .connected_peers
-                                        .iter()
-                                        .copied()
-                                    {
+                                    for peer in share.known_peers.iter().copied() {
+                                        if !runtime_state
+                                            .lock()
+                                            .expect("runtime state lock")
+                                            .connected_peers
+                                            .contains(&peer)
+                                        {
+                                            continue;
+                                        }
                                         swarm.behaviour_mut().request_response.send_request(
                                             &peer,
                                             SyncMessage::FileChanged {
@@ -252,13 +295,15 @@ impl NetworkManager {
                                             pending_manifest.insert((peer, share_id));
                                         }
                                     } else {
-                                        for peer in runtime_state
-                                            .lock()
-                                            .expect("runtime state lock")
-                                            .connected_peers
-                                            .iter()
-                                            .copied()
-                                        {
+                                        for peer in share.known_peers.iter().copied() {
+                                            if !runtime_state
+                                                .lock()
+                                                .expect("runtime state lock")
+                                                .connected_peers
+                                                .contains(&peer)
+                                            {
+                                                continue;
+                                            }
                                             swarm.behaviour_mut().request_response.send_request(
                                                 &peer,
                                                 SyncMessage::RequestManifest { share_id: share_id.clone() },
@@ -333,7 +378,7 @@ impl NetworkManager {
                                                 handle_inbound_request(
                                                     &app,
                                                     &notes_root,
-                                                    &shares,
+                                                    &mut shares,
                                                     &mut swarm.behaviour_mut().request_response,
                                                     &mut pending_download_target,
                                                     peer,
@@ -357,9 +402,17 @@ impl NetworkManager {
                                     }
                                     request_response::Event::OutboundFailure { peer, error, .. } => {
                                         log::warn!("Outbound request failure to {}: {}", peer, error);
+                                        let _ = app.emit("p2p-error", serde_json::json!({
+                                            "share_id": "",
+                                            "error": format!("Outbound request failure to {}: {}", peer, error),
+                                        }));
                                     }
                                     request_response::Event::InboundFailure { peer, error, .. } => {
                                         log::warn!("Inbound request failure from {}: {}", peer, error);
+                                        let _ = app.emit("p2p-error", serde_json::json!({
+                                            "share_id": "",
+                                            "error": format!("Inbound request failure from {}: {}", peer, error),
+                                        }));
                                     }
                                     request_response::Event::ResponseSent { .. } => {}
                                 }
@@ -421,6 +474,11 @@ impl NetworkManager {
         let _ = tx.send(NetworkCommand::RemoveShare { share_id });
     }
 
+    pub fn revoke_share(&self, share_id: String) {
+        let Some(tx) = self.command_tx.as_ref() else { return; };
+        let _ = tx.send(NetworkCommand::RevokeShare { share_id });
+    }
+
     pub fn notify_file_change(&self, share_id: String, relative_path: String, is_deleted: bool) {
         let Some(tx) = self.command_tx.as_ref() else { return; };
         let _ = tx.send(NetworkCommand::NotifyFileChange {
@@ -445,6 +503,17 @@ impl NetworkManager {
             .expect("runtime state lock")
             .connected_peers
             .len()
+    }
+
+    pub fn is_peer_connected(&self, peer_id: &str) -> bool {
+        let Ok(peer) = peer_id.parse::<PeerId>() else {
+            return false;
+        };
+        self.runtime_state
+            .lock()
+            .expect("runtime state lock")
+            .connected_peers
+            .contains(&peer)
     }
 }
 
@@ -484,13 +553,28 @@ async fn emit_note_change(app: &AppHandle, notes_root: &Path, full_path: &Path, 
 async fn handle_inbound_request(
     app: &AppHandle,
     notes_root: &Path,
-    shares: &HashMap<String, ShareRuntime>,
+    shares: &mut HashMap<String, ShareRuntime>,
     behaviour: &mut request_response::Behaviour<SyncCodec>,
     _pending_download_target: &mut HashMap<(PeerId, String, String), String>,
     peer: PeerId,
     request: SyncMessage,
     channel: request_response::ResponseChannel<SyncMessage>,
 ) {
+    let request_share_id = match &request {
+        SyncMessage::RequestManifest { share_id }
+        | SyncMessage::RequestFile { share_id, .. }
+        | SyncMessage::FileChanged { share_id, .. }
+        | SyncMessage::ShareRevoked { share_id } => Some(share_id.as_str()),
+        _ => None,
+    };
+    if let Some(share_id) = request_share_id {
+        if let Some(share) = shares.get_mut(share_id) {
+            if share.is_owner {
+                share.known_peers.insert(peer);
+            }
+        }
+    }
+
     match request {
         SyncMessage::RequestManifest { share_id } => {
             if let Some(share) = shares.get(&share_id) {
@@ -516,7 +600,7 @@ async fn handle_inbound_request(
                 let _ = behaviour.send_response(
                     channel,
                     SyncMessage::Error {
-                        message: "Unknown share".to_string(),
+                        message: format!("Share revoked: {}", share_id),
                     },
                 );
             }
@@ -558,7 +642,7 @@ async fn handle_inbound_request(
                 let _ = behaviour.send_response(
                     channel,
                     SyncMessage::Error {
-                        message: "Unknown share".to_string(),
+                        message: format!("Share revoked: {}", share_id),
                     },
                 );
             }
@@ -601,6 +685,27 @@ async fn handle_inbound_request(
                 SyncMessage::SyncComplete { has_conflicts: false },
             );
         }
+        SyncMessage::ShareRevoked { share_id } => {
+            if let Some(share) = shares.get(&share_id) {
+                let _ = app.emit("p2p-share-revoked", serde_json::json!({
+                    "share_id": share_id,
+                    "local_path": share.local_path.to_string_lossy().into_owned(),
+                }));
+                let _ = app.emit("p2p-error", serde_json::json!({
+                    "share_id": share_id,
+                    "error": "This share has been revoked by the owner.",
+                }));
+            } else {
+                let _ = app.emit("p2p-share-revoked", serde_json::json!({
+                    "share_id": share_id,
+                }));
+            }
+            shares.remove(&share_id);
+            let _ = behaviour.send_response(
+                channel,
+                SyncMessage::SyncComplete { has_conflicts: false },
+            );
+        }
         _ => {
             let _ = behaviour.send_response(
                 channel,
@@ -635,6 +740,18 @@ async fn handle_inbound_response(
                     let has_conflicts = !diff.conflicts.is_empty();
                     if !share.is_owner && matches!(share.permission, SharePermission::ReadOnly) {
                         let remote_map: HashMap<_, _> = files.iter().map(|m| (&m.path, m)).collect();
+                        for remote_file in &files {
+                            if !local_manifest.iter().any(|m| m.path == remote_file.path) {
+                                total_requests += 1;
+                                behaviour.send_request(
+                                    &peer,
+                                    SyncMessage::RequestFile {
+                                        share_id: share_id.clone(),
+                                        path: remote_file.path.clone(),
+                                    },
+                                );
+                            }
+                        }
                         for local_file in &local_manifest {
                             if let Some(remote_file) = remote_map.get(&local_file.path) {
                                 if local_file.hash != remote_file.hash {
@@ -654,6 +771,12 @@ async fn handle_inbound_response(
                         }
                     } else {
                         for conflict in &diff.conflicts {
+                            let _ = app.emit("p2p-conflict-detected", serde_json::json!({
+                                "share_id": share_id.clone(),
+                                "file_path": conflict.path.clone(),
+                                "local_hash": conflict.local_hash.clone(),
+                                "remote_hash": conflict.remote_hash.clone(),
+                            }));
                             total_requests += 1;
                             pending_download_target.insert(
                                 (peer, share_id.clone(), conflict.path.clone()),
@@ -782,6 +905,19 @@ async fn handle_inbound_response(
         }
         SyncMessage::Error { message } => {
             log::warn!("Received sync error response: {}", message);
+            if let Some(share_id) = message.strip_prefix("Share revoked: ").map(str::trim) {
+                let _ = app.emit("p2p-sync-status", serde_json::json!({
+                    "share_id": share_id,
+                    "status": SyncStatus::Error("This share has been revoked by the owner.".to_string()),
+                }));
+                let _ = app.emit("p2p-share-revoked", serde_json::json!({
+                    "share_id": share_id,
+                }));
+            }
+            let _ = app.emit("p2p-error", serde_json::json!({
+                "share_id": "",
+                "error": message,
+            }));
         }
         _ => {}
     }

@@ -21,13 +21,18 @@ impl std::fmt::Display for SharePermission {
 
 /// Sync status for a shared folder
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
+#[serde(rename_all = "snake_case")]
 pub enum SyncStatus {
     Idle,
+    #[serde(alias = "discoveringpeer")]
     DiscoveringPeer,
+    #[serde(alias = "connecting")]
     Connecting,
+    #[serde(alias = "syncing")]
     Syncing,
+    #[serde(alias = "synced")]
     Synced,
+    #[serde(alias = "conflict")]
     Conflict,
     Error(String),
 }
@@ -149,6 +154,8 @@ pub enum SyncMessage {
         path: String,
         is_deleted: bool,
     },
+    /// Share was revoked by owner
+    ShareRevoked { share_id: String },
     /// Sync complete
     SyncComplete { has_conflicts: bool },
     /// Error

@@ -70,6 +70,16 @@ export async function revokeShare(shareId: string): Promise<void> {
 }
 
 /**
+ * Leave or revoke a share with optional local folder cleanup.
+ */
+export async function revokeOrLeaveShare(
+  shareId: string,
+  deleteLocalData: boolean
+): Promise<void> {
+  return invoke("p2p_revoke_share", { shareId, deleteLocalData });
+}
+
+/**
  * Get sync status for a specific share
  */
 export async function getSyncStatus(shareId: string): Promise<SyncStatus> {
@@ -81,6 +91,18 @@ export async function getSyncStatus(shareId: string): Promise<SyncStatus> {
  */
 export async function manualSync(shareId: string): Promise<void> {
   return invoke("p2p_manual_sync", { shareId });
+}
+
+export async function updateShareState(
+  shareId: string,
+  status?: SyncStatus,
+  lastSynced?: number
+): Promise<void> {
+  return invoke("p2p_update_share_state", {
+    shareId,
+    status,
+    lastSynced,
+  });
 }
 
 /**

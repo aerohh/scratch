@@ -35,11 +35,23 @@ function normalizeSyncStatus(status: unknown): SyncStatus {
     return "error";
   }
 
-  if (status && typeof status === "object" && "Error" in (status as Record<string, unknown>)) {
+  if (
+    status &&
+    typeof status === "object" &&
+    ("Error" in (status as Record<string, unknown>) ||
+      "error" in (status as Record<string, unknown>))
+  ) {
     return "error";
   }
 
   return "error";
+}
+
+function normalizeShare(share: SharedFolder): SharedFolder {
+  return {
+    ...share,
+    sync_status: normalizeSyncStatus(share.sync_status),
+  };
 }
 
 interface ShareContextValue {
@@ -51,6 +63,7 @@ interface ShareContextValue {
   isCreating: boolean;
   isAccepting: boolean;
   syncProgress: Record<string, { progress: number; file?: string }>;
+  conflicts: Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>;
   error: string | null;
 
   // Actions
@@ -58,8 +71,13 @@ interface ShareContextValue {
   stopP2P: () => Promise<void>;
   createShare: (folderPath: string, permission: SharePermission) => Promise<CreateShareResult | null>;
   acceptShare: (inviteCode: string, destinationPath: string) => Promise<SharedFolder | null>;
-  revokeShare: (shareId: string) => Promise<boolean>;
+  revokeShare: (shareId: string, deleteLocalData?: boolean) => Promise<boolean>;
   manualSync: (shareId: string) => Promise<boolean>;
+  resolveConflict: (
+    shareId: string,
+    filePath: string,
+    resolution: "keep_local" | "keep_remote" | "keep_both"
+  ) => Promise<boolean>;
   refreshShares: () => Promise<void>;
   refreshP2PStatus: () => Promise<void>;
   clearError: () => void;
@@ -74,6 +92,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
   const [isCreating, setIsCreating] = useState(false);
   const [isAccepting, setIsAccepting] = useState(false);
   const [syncProgress, setSyncProgress] = useState<Record<string, { progress: number; file?: string }>>({});
+  const [conflicts, setConflicts] = useState<Record<string, Array<{ file_path: string; local_hash: string; remote_hash: string }>>>({});
   const [error, setError] = useState<string | null>(null);
 
   // Use refs to avoid stale closure issues
@@ -112,7 +131,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
     try {
       const sharesList = await shareService.listShares();
       if (requestId === refreshRequestIdRef.current) {
-        setShares(sharesList);
+        setShares(sharesList.map(normalizeShare));
       }
     } catch (err) {
       if (requestId === refreshRequestIdRef.current) {
@@ -213,10 +232,10 @@ export function ShareProvider({ children }: { children: ReactNode }) {
   );
 
   // Revoke share
-  const revokeShare = useCallback(async (shareId: string): Promise<boolean> => {
+  const revokeShare = useCallback(async (shareId: string, deleteLocalData = false): Promise<boolean> => {
     setError(null);
     try {
-      await shareService.revokeShare(shareId);
+      await shareService.revokeOrLeaveShare(shareId, deleteLocalData);
       // Refresh shares list
       await refreshShares();
       return true;
@@ -240,6 +259,31 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       return false;
     }
   }, [ensureP2PRunning]);
+
+  const resolveConflict = useCallback(
+    async (
+      shareId: string,
+      filePath: string,
+      resolution: "keep_local" | "keep_remote" | "keep_both"
+    ): Promise<boolean> => {
+      setError(null);
+      try {
+        await shareService.resolveConflict(shareId, filePath, resolution);
+        setConflicts((prev) => ({
+          ...prev,
+          [shareId]: (prev[shareId] || []).filter((entry) => entry.file_path !== filePath),
+        }));
+        await shareService.updateShareState(shareId, "synced", Math.floor(Date.now() / 1000));
+        await refreshShares();
+        return true;
+      } catch (err) {
+        const message = err instanceof Error ? err.message : "Failed to resolve conflict";
+        setError(message);
+        return false;
+      }
+    },
+    [refreshShares]
+  );
 
   // Initialize P2P on mount
   useEffect(() => {
@@ -273,6 +317,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
             : share
         )
       );
+      void shareService.updateShareState(data.payload.share_id, status);
     }).then((unlisten) => unlisteners.push(unlisten));
 
     listen("p2p-sync-start", (event: unknown) => {
@@ -281,6 +326,12 @@ export function ShareProvider({ children }: { children: ReactNode }) {
         ...prev,
         [data.payload.share_id]: { progress: 0 },
       }));
+      setShares((prev) =>
+        prev.map((share) =>
+          share.id === data.payload.share_id ? { ...share, sync_status: "syncing" } : share
+        )
+      );
+      void shareService.updateShareState(data.payload.share_id, "syncing");
     }).then((unlisten) => unlisteners.push(unlisten));
 
     listen("p2p-sync-progress", (event: unknown) => {
@@ -307,6 +358,54 @@ export function ShareProvider({ children }: { children: ReactNode }) {
           return next;
         });
       }, 2000);
+      void shareService.updateShareState(
+        data.payload.share_id,
+        undefined,
+        Math.floor(Date.now() / 1000)
+      );
+      void refreshShares();
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-conflict-detected", (event: unknown) => {
+      const data = event as {
+        payload: { share_id: string; file_path: string; local_hash: string; remote_hash: string };
+      };
+      setConflicts((prev) => {
+        const existing = prev[data.payload.share_id] || [];
+        if (existing.some((entry) => entry.file_path === data.payload.file_path)) {
+          return prev;
+        }
+        return {
+          ...prev,
+          [data.payload.share_id]: [...existing, {
+            file_path: data.payload.file_path,
+            local_hash: data.payload.local_hash,
+            remote_hash: data.payload.remote_hash,
+          }],
+        };
+      });
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-error", (event: unknown) => {
+      const data = event as { payload: { error?: string } };
+      if (data.payload?.error) {
+        setError(data.payload.error);
+      }
+    }).then((unlisten) => unlisteners.push(unlisten));
+
+    listen("p2p-share-revoked", (event: unknown) => {
+      const data = event as { payload: { share_id: string } };
+      const share = sharesRef.current.find((item) => item.id === data.payload.share_id);
+      const shouldDeleteLocalData = share ? !share.is_owner : true;
+      setConflicts((prev) => {
+        const next = { ...prev };
+        delete next[data.payload.share_id];
+        return next;
+      });
+      void shareService
+        .revokeOrLeaveShare(data.payload.share_id, shouldDeleteLocalData)
+        .then(() => refreshShares())
+        .catch(() => refreshShares());
     }).then((unlisten) => unlisteners.push(unlisten));
 
     // Listen for peer events
@@ -324,7 +423,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
     return () => {
       unlisteners.forEach((unlisten) => unlisten());
     };
-  }, [refreshP2PStatus]);
+  }, [refreshP2PStatus, refreshShares]);
 
   const value: ShareContextValue = useMemo(
     () => ({
@@ -335,6 +434,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isCreating,
       isAccepting,
       syncProgress,
+      conflicts,
       error,
       startP2P,
       stopP2P,
@@ -342,6 +442,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       acceptShare,
       revokeShare,
       manualSync,
+      resolveConflict,
       refreshShares,
       refreshP2PStatus,
       clearError,
@@ -354,6 +455,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       isCreating,
       isAccepting,
       syncProgress,
+      conflicts,
       error,
       startP2P,
       stopP2P,
@@ -361,6 +463,7 @@ export function ShareProvider({ children }: { children: ReactNode }) {
       acceptShare,
       revokeShare,
       manualSync,
+      resolveConflict,
       refreshShares,
       refreshP2PStatus,
       clearError,

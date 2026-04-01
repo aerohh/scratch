@@ -3,6 +3,7 @@ import { toast } from "sonner";
 import { useShare } from "../../context/ShareContext";
 import { Button } from "../ui";
 import AcceptShareModal from "./AcceptShareModal";
+import ConflictResolutionDialog from "./ConflictResolutionDialog";
 import SyncStatusIndicator from "./SyncStatusIndicator";
 import { FolderIcon, LinkIcon, RefreshCwIcon, ShareIcon, TrashIcon } from "../icons";
 
@@ -18,10 +19,13 @@ export default function SharedFoldersSection() {
     stopP2P,
     revokeShare,
     manualSync,
+    resolveConflict,
     refreshShares,
     syncProgress,
+    conflicts,
   } = useShare();
   const [acceptOpen, setAcceptOpen] = useState(false);
+  const [conflictShareId, setConflictShareId] = useState<string | null>(null);
   const sortedShares = useMemo(
     () =>
       [...shares].sort((a, b) => {
@@ -44,6 +48,12 @@ export default function SharedFoldersSection() {
     } catch {
       // Surface error via context
     }
+  };
+
+  const formatLastSynced = (timestamp: number) => {
+    if (!timestamp) return "Never synced";
+    const date = new Date(timestamp * 1000);
+    return `Last synced ${date.toLocaleString()}`;
   };
 
   return (
@@ -105,6 +115,9 @@ export default function SharedFoldersSection() {
                     <div className="text-xs text-text-muted truncate">
                       {share.is_owner ? "Owner" : "Joined"} • Peer {share.peer_id}
                     </div>
+                    <div className="text-xs text-text-muted truncate">
+                      {formatLastSynced(share.last_synced)}
+                    </div>
                   </div>
 
                   <div className="flex gap-1.5">
@@ -123,13 +136,29 @@ export default function SharedFoldersSection() {
                       variant="ghost"
                       size="sm"
                       onClick={async () => {
-                        const ok = await revokeShare(share.id);
-                        if (ok) toast.success("Share revoked");
+                        const action = share.is_owner ? "revoke" : "leave";
+                        const confirmed = window.confirm(
+                          share.is_owner
+                            ? "Revoke this share for connected peers?"
+                            : "Leave this shared folder and remove local shared data?"
+                        );
+                        if (!confirmed) return;
+                        const ok = await revokeShare(share.id, !share.is_owner);
+                        if (ok) toast.success(action === "revoke" ? "Share revoked" : "Left shared folder");
                       }}
                     >
                       <TrashIcon className="w-3.5 h-3.5 mr-1.5" />
-                      Revoke
+                      {share.is_owner ? "Revoke" : "Leave"}
                     </Button>
+                    {(conflicts[share.id] || []).length > 0 && (
+                      <Button
+                        variant="outline"
+                        size="sm"
+                        onClick={() => setConflictShareId(share.id)}
+                      >
+                        Resolve
+                      </Button>
+                    )}
                   </div>
                 </div>
 
@@ -152,6 +181,19 @@ export default function SharedFoldersSection() {
       </div>
 
       {acceptOpen ? <AcceptShareModal onClose={() => setAcceptOpen(false)} /> : null}
+      {conflictShareId ? (
+        <ConflictResolutionDialog
+          shareName={sortedShares.find((share) => share.id === conflictShareId)?.remote_path || "Shared Folder"}
+          conflicts={conflicts[conflictShareId] || []}
+          onResolve={async (filePath, resolution) => {
+            const ok = await resolveConflict(conflictShareId, filePath, resolution);
+            if (ok) {
+              toast.success("Conflict resolved");
+            }
+          }}
+          onClose={() => setConflictShareId(null)}
+        />
+      ) : null}
     </section>
   );
 }
