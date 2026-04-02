@@ -17,7 +17,7 @@ use tauri::{AppHandle, Emitter};
 use tokio::sync::{mpsc, Semaphore};
 
 // Type alias for Kademlia behaviour with MemoryStore
-type KadBehaviour = kad::Behaviour<kad::store::MemoryStore>>;
+type KadBehaviour = kad::Behaviour<kad::store::MemoryStore>;
 
 // Type alias for GossipSub
 type Gossipsub = gossipsub::Behaviour;
