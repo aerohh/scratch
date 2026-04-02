@@ -1,3 +1,5 @@
+#![recursion_limit = "512"]
+
 use anyhow::Result;
 use base64::Engine;
 use libp2p::identity::Keypair;
@@ -4457,7 +4459,7 @@ async fn p2p_get_connection_info(
         }
 
         if let Some(metrics) = best_metrics {
-            (metrics.connection_type, metrics.latency_ms, metrics.bandwidth_bps)
+            (metrics.connection_type(), metrics.latency_ms(), metrics.bandwidth_bps())
         } else {
             // Fallback: determine from sync status
             let conn_type = if share.sync_status.is_synced() || share.sync_status == p2p::SyncStatus::Idle {

@@ -96,7 +96,7 @@ struct ShareRuntime {
 
 /// Connection metrics for a peer
 #[derive(Debug, Clone)]
-struct PeerConnectionMetrics {
+pub struct PeerConnectionMetrics {
     connection_type: ConnectionType,
     latency_ms: Option<u64>,
     bandwidth_bps: Option<u64>,
@@ -224,6 +224,21 @@ impl PeerConnectionMetrics {
                 });
             }
         }
+    }
+
+    /// Get connection type
+    pub fn connection_type(&self) -> ConnectionType {
+        self.connection_type
+    }
+
+    /// Get latency in milliseconds
+    pub fn latency_ms(&self) -> Option<u64> {
+        self.latency_ms
+    }
+
+    /// Get bandwidth in bits per second
+    pub fn bandwidth_bps(&self) -> Option<u64> {
+        self.bandwidth_bps
     }
 }
 
@@ -454,8 +469,8 @@ impl NetworkManager {
                 ];
 
                 let mut autonat_config = autonat::Config::default();
-                autonat_config.retry_interval(Duration::from_secs(30));
-                autonat_config.boot_delay(Duration::from_secs(5));
+                autonat_config.retry_interval = Duration::from_secs(30);
+                autonat_config.boot_delay = Duration::from_secs(5);
 
                 let autonat = autonat::Behaviour::new(peer_id, autonat_config);
 
@@ -478,7 +493,7 @@ impl NetworkManager {
                     .validation_mode(ValidationMode::Strict)
                     .message_id_fn(|message: &gossipsub::Message| {
                         // Use content-based message ID for deduplication
-                        MessageId::from(&message.data)
+                        MessageId::from(message.data.clone())
                     })
                     .build()
                     .map_err(|e| anyhow::anyhow!("Failed to create gossipsub config: {}", e))
@@ -585,7 +600,7 @@ impl NetworkManager {
                                 // Clean up all pending operations for this share
                                 shares.remove(&share_id);
                                 pending_manifest.retain(|(_, id)| id != &share_id);
-                                pending_download_target.retain(|(_, id, _)| id != &share_id);
+                                pending_download_target.retain(|(_, id, _), _| id != &share_id);
                                 // Clean up active syncs for this share
                                 active_syncs.retain(|(_, id), _| id != &share_id);
                                 // Clean up any active transfers
@@ -605,7 +620,6 @@ impl NetworkManager {
                                         SyncEngine::new(share.local_path.clone())
                                             .hash_file(&full_path)
                                             .await
-                                            .unwrap_or_default()
                                     } else {
                                         String::new()
                                     }
@@ -616,7 +630,7 @@ impl NetworkManager {
                                 let file_modified = if !is_deleted {
                                     if let Some(full_path) = resolve_share_file(&share.local_path, &relative_path) {
                                         tokio::fs::metadata(&full_path).await
-                                            .and_then(|m| Ok(m.modified()?.timestamp_secs()))
+                                            .and_then(|m| Ok(m.modified()?.duration_since(std::time::UNIX_EPOCH).unwrap().as_secs()))
                                             .unwrap_or(0)
                                     } else {
                                         0
@@ -632,7 +646,7 @@ impl NetworkManager {
                                         path: relative_path.clone(),
                                         is_deleted,
                                         hash: file_hash.clone(),
-                                        modified: file_modified,
+                                        modified: file_modified as i64,
                                         peer_id: local_peer_id.to_string(),
                                         timestamp: chrono::Utc::now().timestamp(),
                                     };
@@ -644,12 +658,15 @@ impl NetworkManager {
                                 }
 
                                 // Also send directly to connected peers for immediate notification
-                                let state = runtime_state.lock().expect("runtime state lock");
-                                for peer in share.known_peers.iter().copied() {
-                                    if !state.connected_peers.contains(&peer) {
-                                        continue;
-                                    }
-                                    drop(state); // Release lock before sending
+                                let connected_peers: Vec<_> = {
+                                    let state = runtime_state.lock().expect("runtime state lock");
+                                    share.known_peers.iter()
+                                        .filter(|peer| state.connected_peers.contains(*peer))
+                                        .copied()
+                                        .collect()
+                                };
+
+                                for peer in connected_peers {
                                     swarm.behaviour_mut().request_response.send_request(
                                         &peer,
                                         SyncMessage::FileChanged {
@@ -679,17 +696,21 @@ impl NetworkManager {
                             }
                             NetworkCommand::TriggerSync { share_id } => {
                                 if let Some(share) = shares.get(&share_id) {
-                                    let state = runtime_state.lock().expect("runtime state lock");
-                                    for peer in share.known_peers.iter().copied() {
-                                        if state.connected_peers.contains(&peer) {
-                                            drop(state); // Release lock before sending
-                                            swarm.behaviour_mut().request_response.send_request(
-                                                &peer,
-                                                SyncMessage::RequestManifest { share_id: share_id.clone() },
-                                            );
-                                        } else {
-                                            pending_manifest.insert((peer, share_id.clone()));
-                                        }
+                                    let (connected_peers, pending_peers): (Vec<_>, Vec<_>) = {
+                                        let state = runtime_state.lock().expect("runtime state lock");
+                                        share.known_peers.iter()
+                                            .partition(|peer| state.connected_peers.contains(*peer))
+                                    };
+
+                                    for peer in connected_peers {
+                                        swarm.behaviour_mut().request_response.send_request(
+                                            &peer,
+                                            SyncMessage::RequestManifest { share_id: share_id.clone() },
+                                        );
+                                    }
+
+                                    for peer in pending_peers {
+                                        pending_manifest.insert((peer, share_id.clone()));
                                     }
                                 }
                             }
@@ -752,28 +773,7 @@ impl NetworkManager {
 
                                 // If peer is connected, notify them of permission change
                                 if runtime_state.lock().expect("runtime state lock").connected_peers.contains(&peer_id) {
-                                    // Send a FileChanged notification as a way to prompt re-sync with new permissions
-                                    if let Some(share) = shares.get(&share_id) {
-                                        share.known_peers.insert(peer_id); // Ensure they're in known peers
-                                    }
-                                }
-                            }
-                            NetworkCommand::AddPeerToShare { share_id, peer_id } => {
-                                if let Some(share) = shares.get_mut(&share_id) {
-                                    share.known_peers.insert(peer_id);
-                                    log::info!("Added peer {} to share {}", peer_id, share_id);
-
-                                    // Log member joined activity
-                                    let _ = app.emit("p2p-activity-entry", serde_json::json!({
-                                        "share_id": share_id,
-                                        "entry": {
-                                            "timestamp": chrono::Utc::now().timestamp(),
-                                            "event_type": "peer_joined",
-                                            "peer_id": peer_id.to_string(),
-                                            "peer_name": null,
-                                            "details": format!("Peer {} joined the share", peer_id),
-                                        }
-                                    }));
+                                    // Peer is connected, they will receive the notification via the event emitted above
                                 }
                             }
                             NetworkCommand::LogActivity {
@@ -815,10 +815,12 @@ impl NetworkManager {
                             }
                             libp2p::swarm::SwarmEvent::ConnectionEstablished { peer_id, endpoint, .. } => {
                                 // Determine connection type (DirectTcp vs Relay)
-                                let connection_type = if endpoint.get_remote_addr()
-                                    .and_then(|addr| addr.protocol_stack().last())
-                                    .map(|p| p.as_str().starts_with("ws") || p.as_str().starts_with("wss"))
-                                    .unwrap_or(false) {
+                                let addr = endpoint.get_remote_address();
+                                let is_relay = addr.iter().last()
+                                    .map(|p| matches!(p, libp2p::multiaddr::Protocol::Ws(_) | libp2p::multiaddr::Protocol::Wss(_)))
+                                    .unwrap_or(false);
+
+                                let connection_type = if is_relay {
                                     ConnectionType::Relay
                                 } else {
                                     ConnectionType::DirectTcp
@@ -836,8 +838,7 @@ impl NetworkManager {
                                 }));
 
                                 // Add peer's actual address to Kademlia DHT
-                                let addr = endpoint.get_remote_addr().clone();
-                                let _ = swarm.behaviour_mut().kad.add_address(&peer_id, addr);
+                                let _ = swarm.behaviour_mut().kad.add_address(&peer_id, addr.clone());
 
                                 // Log member joined for any shares this peer is part of
                                 for (share_id, share) in shares.iter() {
@@ -920,6 +921,7 @@ impl NetworkManager {
                                                     peer,
                                                     request,
                                                     channel,
+                                                    &runtime_state,
                                                 ).await;
                                             }
                                             request_response::Message::Response { response, .. } => {
@@ -988,7 +990,7 @@ impl NetworkManager {
                                         log::info!("NAT status changed from {:?} to {:?}", old, new);
 
                                         // Emit connection status to frontend
-                                        let connection_type = if matches!(new, autonat::NatStatus::Private(_)) {
+                                        let connection_type = if matches!(new, autonat::NatStatus::Private) {
                                             ConnectionType::Relay
                                         } else {
                                             ConnectionType::DirectTcp
@@ -1029,25 +1031,22 @@ impl NetworkManager {
                                             }
                                         }
                                     }
-                                    gossipsub::Event::Subscribed { peer, topic } => {
-                                        log::debug!("Peer {} subscribed to {}", peer, topic);
+                                    gossipsub::Event::Subscribed { peer_id, topic } => {
+                                        log::debug!("Peer {} subscribed to {}", peer_id, topic);
                                         // Peer joined our mesh, add them to relevant shares
                                         for (share_id, share) in shares.iter() {
                                             // If peer is a known member, they've rejoined the mesh
-                                            if share.known_peers.contains(&peer) {
+                                            if share.known_peers.contains(&peer_id) {
                                                 let _ = app.emit("p2p-member-joined", serde_json::json!({
                                                     "share_id": share_id,
-                                                    "peer_id": peer.to_string(),
+                                                    "peer_id": peer_id.to_string(),
                                                     "peer_name": serde_json::Value::Null,
                                                 }));
                                             }
                                         }
                                     }
-                                    gossipsub::Event::Unsubscribed { peer, topic } => {
-                                        log::debug!("Peer {} unsubscribed from {}", peer, topic);
-                                    }
-                                    gossipsub::Event::Gossip { .. } => {
-                                        // Gossip propagation, ignore for now
+                                    gossipsub::Event::Unsubscribed { peer_id, topic } => {
+                                        log::debug!("Peer {} unsubscribed from {}", peer_id, topic);
                                     }
                                     _ => {}
                                 }
@@ -1273,6 +1272,7 @@ async fn handle_inbound_request(
     peer: PeerId,
     request: SyncMessage,
     channel: request_response::ResponseChannel<SyncMessage>,
+    runtime_state: &Arc<std::sync::Mutex<NetworkRuntimeState>>,
 ) {
     // Extract share_id from request and validate peer membership
     let request_share_id = match &request {
@@ -1372,7 +1372,7 @@ async fn handle_inbound_request(
                     // Get file metadata first to check size
                     match tokio::fs::metadata(&full_path).await {
                         Ok(metadata) => {
-                            let file_size = metadata.len();
+                            let _file_size = metadata.len();
 
                             // Get adaptive chunk size based on peer's bandwidth
                             let chunk_size = runtime_state.lock().expect("runtime state lock")

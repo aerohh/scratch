@@ -237,7 +237,7 @@ impl SyncEngine {
             return Ok(data.to_vec());
         }
 
-        let compressed = zstd::encode_all(data.as_ref(), 3)
+        let compressed = zstd::encode_all(&data[..], 3)
             .map_err(|e| anyhow::anyhow!("Compression failed: {}", e))?;
 
         // Only use compressed data if it's actually smaller
@@ -251,7 +251,7 @@ impl SyncEngine {
     /// Decompress data (attempts zstd decompression)
     pub fn decompress_data(data: &[u8]) -> Result<Vec<u8>> {
         // Try to decompress as zstd
-        match zstd::decode_all(data.as_ref()) {
+        match zstd::decode_all(&data[..]) {
             Ok(decompressed) => Ok(decompressed),
             Err(_) => {
                 // If decompression fails, assume data wasn't compressed

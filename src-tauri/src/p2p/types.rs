@@ -83,7 +83,7 @@ pub struct ShareMember {
 }
 
 /// Connection type (Phase 3)
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ConnectionType {
     DirectTcp,
