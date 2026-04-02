@@ -433,7 +433,7 @@ impl NetworkManager {
             .with_tokio()
             .with_tcp(
                 tcp::Config::default(),
-                noise::Config::new,
+                libp2p::noise::Config::new,
                 yamux::Config::default,
             )?
             .with_behaviour(|key| {
@@ -526,11 +526,6 @@ impl NetworkManager {
         swarm
             .listen_on("/ip4/0.0.0.0/tcp/0".parse().expect("valid listen multiaddr"))
             .map_err(|e| anyhow::anyhow!("Failed to start listener: {}", e))?;
-
-        // Also listen on WebSocket for better NAT traversal
-        swarm
-            .listen_on("/ip4/0.0.0.0/tcp/0/ws".parse().expect("valid ws multiaddr"))
-            .map_err(|e| anyhow::anyhow!("Failed to start WebSocket listener: {}", e))?;
 
         let (command_tx, mut command_rx) = mpsc::unbounded_channel::<NetworkCommand>();
         let runtime_state = Arc::clone(&self.runtime_state);
